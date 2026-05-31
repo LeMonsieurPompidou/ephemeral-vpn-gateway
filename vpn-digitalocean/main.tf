@@ -1,10 +1,14 @@
 locals {
-  vpn_name             = "ephemeral-vpn-gateway"
-  wireguard_port       = 51820
+  vpn_name             = "ephemeral-vpn-do"
   wireguard_server_ip  = "10.8.0.1/24"
   wireguard_laptop_ip  = "10.8.0.2/32"
   wireguard_phone_ip   = "10.8.0.3/32"
+  wireguard_port       = 51820
   wireguard_client_dns = "1.1.1.1"
+}
+
+data "digitalocean_ssh_key" "main" {
+  name = var.ssh_key_name
 }
 
 resource "wireguard_asymmetric_key" "server" {}
@@ -13,84 +17,58 @@ resource "wireguard_asymmetric_key" "laptop" {}
 
 resource "wireguard_asymmetric_key" "phone" {}
 
-resource "scaleway_account_ssh_key" "main" {
-  name       = "${local.vpn_name}-key"
-  public_key = file(pathexpand("~/.ssh/id_ed25519.pub"))
+resource "digitalocean_droplet" "vpn" {
+  name   = local.vpn_name
+  size   = "s-1vcpu-1gb"
+  image  = "ubuntu-24-04-x64"
+  region = var.region
+
+  ssh_keys = [data.digitalocean_ssh_key.main.id]
+
+user_data = <<-CLOUDINIT
+    #cloud-config
+    write_files:
+      - path: /etc/wireguard/wg0.conf
+        permissions: "0600"
+        content: |
+          [Interface]
+          Address = ${local.wireguard_server_ip}
+          ListenPort = ${local.wireguard_port}
+          PrivateKey = ${wireguard_asymmetric_key.server.private_key}
+          PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+          PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+          [Peer]
+          PublicKey = ${wireguard_asymmetric_key.laptop.public_key}
+          AllowedIPs = ${local.wireguard_laptop_ip}
+
+          [Peer]
+          PublicKey = ${wireguard_asymmetric_key.phone.public_key}
+          AllowedIPs = ${local.wireguard_phone_ip}
+    runcmd:
+      - |
+        bash -lc '
+          set -euo pipefail
+
+          while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1; do
+            echo "Waiting for apt lock..."
+            sleep 3
+          done
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y wireguard wireguard-tools iptables
+
+          printf "net.ipv4.ip_forward=1\n" > /etc/sysctl.d/99-wireguard.conf
+          sysctl -w net.ipv4.ip_forward=1
+
+          systemctl enable --now wg-quick@wg0
+        '
+  CLOUDINIT
 }
 
-resource "scaleway_instance_ip" "vpn_ip" {
-}
-
-resource "scaleway_instance_security_group" "vpn_sg" {
-  name                    = "${local.vpn_name}-sg"
-  description             = "Security group for personal WireGuard VPN"
-  inbound_default_policy  = "drop"
-  outbound_default_policy = "accept"
-
-  inbound_rule {
-    action   = "accept"
-    port     = 22
-    protocol = "TCP"
-    ip_range = "0.0.0.0/0"
-  }
-
-  inbound_rule {
-    action   = "accept"
-    port     = local.wireguard_port
-    protocol = "UDP"
-    ip_range = "0.0.0.0/0"
-  }
-}
-
-resource "scaleway_instance_server" "vpn" {
-  name              = local.vpn_name
-  type              = "PLAY2-MICRO" # Alternative: STARDUST1-A
-  image             = "ubuntu_noble"
-  ip_id             = scaleway_instance_ip.vpn_ip.id
-  security_group_id = scaleway_instance_security_group.vpn_sg.id
-
-  root_volume {
-    delete_on_termination = true
-  }
-
-  user_data = {
-    cloud-init = <<-CLOUDINIT
-      #cloud-config
-      package_update: true
-      package_upgrade: true
-      packages:
-        - iptables
-        - wireguard
-      write_files:
-        - path: /etc/wireguard/wg0.conf
-          permissions: "0600"
-          content: |
-            [Interface]
-            Address = ${local.wireguard_server_ip}
-            ListenPort = ${local.wireguard_port}
-            PrivateKey = ${wireguard_asymmetric_key.server.private_key}
-            PostUp = OUTBOUND_IFACE="$(ip route show default | awk '/default/ {print $5; exit}')"; iptables -t nat -A POSTROUTING -o "$OUTBOUND_IFACE" -j MASQUERADE
-            PostDown = OUTBOUND_IFACE="$(ip route show default | awk '/default/ {print $5; exit}')"; iptables -t nat -D POSTROUTING -o "$OUTBOUND_IFACE" -j MASQUERADE
-
-            [Peer]
-            PublicKey = ${wireguard_asymmetric_key.laptop.public_key}
-            AllowedIPs = ${local.wireguard_laptop_ip}
-
-            [Peer]
-            PublicKey = ${wireguard_asymmetric_key.phone.public_key}
-            AllowedIPs = ${local.wireguard_phone_ip}
-      runcmd:
-        - [ bash, -lc, "printf 'net.ipv4.ip_forward=1\\n' > /etc/sysctl.d/99-wireguard.conf" ]
-        - [ bash, -lc, "sysctl --system" ]
-        - [ bash, -lc, "systemctl enable --now wg-quick@wg0" ]
-    CLOUDINIT
-  }
-
-  tags = ["vpn", "wireguard", "ephemeral", "france"]
-}
-
-resource "local_file" "wg_config" {
-  filename = pathexpand("~/Desktop/scaleway-vpn.conf")
+resource "local_file" "laptop_wg_config" {
+  filename = pathexpand("~/Desktop/digitalocean-vpn.conf")
 
   content = <<-EOT
     [Interface]
@@ -100,14 +78,14 @@ resource "local_file" "wg_config" {
 
     [Peer]
     PublicKey = ${wireguard_asymmetric_key.server.public_key}
-    Endpoint = ${scaleway_instance_ip.vpn_ip.address}:${local.wireguard_port}
+    Endpoint = ${digitalocean_droplet.vpn.ipv4_address}:${local.wireguard_port}
     AllowedIPs = 0.0.0.0/0, ::/0
     PersistentKeepalive = 25
   EOT
 }
 
 resource "local_file" "phone_wg_qrcode" {
-  filename = pathexpand("~/Desktop/phone-vpn-qrcode.html")
+  filename = pathexpand("~/Desktop/phone-digitalocean-vpn-qrcode.html")
 
   content = <<-EOT
     <!doctype html>
@@ -236,7 +214,7 @@ resource "local_file" "phone_wg_qrcode" {
 
           [Peer]
           PublicKey = ${wireguard_asymmetric_key.server.public_key}
-          Endpoint = ${scaleway_instance_ip.vpn_ip.address}:${local.wireguard_port}
+          Endpoint = "${digitalocean_droplet.vpn.ipv4_address}:51820"
           AllowedIPs = 0.0.0.0/0, ::/0
           PersistentKeepalive = 25
         CFG
@@ -257,10 +235,10 @@ resource "local_file" "phone_wg_qrcode" {
 
 output "vpn_public_ip" {
   description = "Public IP of the VPN gateway"
-  value       = scaleway_instance_ip.vpn_ip.address
+  value       = digitalocean_droplet.vpn.ipv4_address
 }
 
 output "ssh_connect" {
   description = "SSH command to connect to the VPN gateway"
-  value       = "ssh root@${scaleway_instance_ip.vpn_ip.address}"
+  value       = "ssh root@${digitalocean_droplet.vpn.ipv4_address}"
 }
