@@ -10,6 +10,8 @@ This project is an Infrastructure as Code (IaC) setup that uses Terraform to dep
 
 The gateway is designed for short-lived usage: create it when needed, use a French egress IP to securely bypass streaming geo-restrictions, and destroy it afterward to minimize cost.
 
+Terraform now also generates the WireGuard key material it needs for the server and both clients, then writes client files to your Windows Desktop during `terraform apply`.
+
 ## Architecture
 
 ```text
@@ -68,6 +70,11 @@ The deployment also registers your local public SSH key in Scaleway via:
 
 - `scaleway_account_ssh_key.main` with `~/.ssh/id_ed25519.pub`
 
+It also creates the WireGuard client artifacts on your Windows Desktop:
+
+- `scaleway-vpn.conf` for the laptop client
+- `phone-vpn-qrcode.html` for the phone client QR code
+
 If you do not already have the key pair:
 
 ```bash
@@ -85,7 +92,7 @@ terraform apply
 
 When prompted, type `yes` to confirm resource creation.
 
-After apply completes, Terraform outputs the public IP as `vpn_public_ip`.
+After apply completes, Terraform outputs the public IP as `vpn_public_ip` and writes the client files directly to your Desktop.
 
 ## Multi-Region Deployment
 
@@ -117,17 +124,17 @@ ssh root@<vpn_public_ip>
 
 Replace `<vpn_public_ip>` with the `vpn_public_ip` output value.
 
-### 2) Retrieve WireGuard client configuration / QR code
+### 2) Use the generated laptop configuration
 
-Once connected to the server:
+After `terraform apply` completes, open `C:\Users\ADMIN\Desktop\scaleway-vpn.conf` and import it into your WireGuard desktop client.
 
-```bash
-docker logs wireguard
-```
+The file already contains the correct laptop private key, the server public key, the public endpoint, DNS, and the tunnel IP settings.
 
-The container logs include peer configuration and a QR code you can scan from your WireGuard mobile client.
+### 3) Scan the phone QR code
 
-Note: this deployment sets `PEERS="phone,laptop"`. `docker logs wireguard` will therefore print a QR code for the phone peer and a plain-text WireGuard config block for the laptop peer. Copy the laptop config text into a file named `scaleway-vpn.conf` and import it into your WireGuard desktop client.
+Open `C:\Users\ADMIN\Desktop\phone-vpn-qrcode.html` in a browser.
+
+The page renders the phone WireGuard configuration as a QR code and also shows the underlying config text on the page, so you can scan it directly with the WireGuard mobile app.
 
 ## How to Destroy (Important)
 
@@ -183,10 +190,12 @@ Use this quick workflow:
 terraform apply
 ssh-keygen -R <vpn_public_ip>
 ssh root@<vpn_public_ip>
-docker logs wireguard
 ```
 
-After retrieving the latest WireGuard peer config/QR from `docker logs wireguard`, update your phone client so it matches the new deployment.
+Then reopen both Desktop artifacts so they match the new deployment:
+
+- `C:\Users\ADMIN\Desktop\scaleway-vpn.conf`
+- `C:\Users\ADMIN\Desktop\phone-vpn-qrcode.html`
 
 ## Security Notes
 
