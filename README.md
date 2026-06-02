@@ -28,10 +28,19 @@ ephemeral-vpn-gateway/
 │   ├── main.tf
 │   ├── providers.tf
 │   └── variables.tf
-└── vpn-digitalocean/
-    ├── main.tf
-    ├── providers.tf
-    └── variables.tf
+├── vpn-digitalocean/
+│   ├── main.tf
+│   ├── providers.tf
+│   └── variables.tf
+└── vpn-gui-app/
+    ├── app.py
+    ├── bridge.py
+    └── ui/
+        ├── index.html
+        ├── style.css
+        ├── script.js
+        └── assets/
+            └── Heres_VPN_logo.png
 ```
 
 Each folder is a self-contained Terraform root module. The Scaleway module targets European zones, while the DigitalOcean module targets global regions such as New York, Amsterdam, Frankfurt, London, and others.
@@ -44,6 +53,8 @@ Each folder is a self-contained Terraform root module. The Scaleway module targe
 - A DigitalOcean account with an API token if you want to use the global deployment.
 - A local SSH key pair, typically `~/.ssh/id_ed25519` and `~/.ssh/id_ed25519.pub`.
 - Windows PowerShell for the automation shortcuts and day-to-day operations.
+
+Note: the repository now contains a small Python-based GUI that wraps the existing Terraform modules. See "How to Run the GUI" below.
 
 ## Configuration
 
@@ -198,7 +209,44 @@ During deployment, Terraform writes the client artifacts directly to your Window
 - Laptop WireGuard configuration file.
 - Phone QR code HTML file with embedded QRCode.js.
 
-These artifacts are regenerated on every apply so the laptop and phone always receive fresh keys and a current endpoint.
+## GUI Application
+
+Hérès VPN includes a lightweight desktop GUI that provides an approachable, one-click workflow for deploying the same Terraform modules.
+
+- The GUI is located under the `vpn-gui-app/` folder and launches a local Web UI inside a native window using `pywebview`.
+- The front-end supports:
+    - Multi-provider toggle: switch between `Scaleway` and `DigitalOcean` stacks.
+    - Dynamic location selection based on provider (zones / regions dropdown).
+    - One-click `Deploy VPN` and `Destroy VPN` actions (these currently call the bridge hooks that you can implement to invoke Terraform).
+    - Real-time status area showing connection state, public IP, and a dynamically rendered WireGuard QR Code for mobile import.
+
+### How to Run the GUI (local development)
+
+1. Create and activate a Python virtual environment (recommended):
+
+```bash
+python -m venv .venv
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+# or Command Prompt
+.\.venv\Scripts\activate.bat
+```
+
+2. Install dependencies (this project uses `pywebview` for the native window):
+
+```bash
+pip install pywebview
+```
+
+3. Launch the app from the repository root:
+
+```bash
+python vpn-gui-app/app.py
+```
+
+Notes:
+- `vpn-gui-app/bridge.py` contains two placeholder functions: `deploy_infrastructure(provider, region)` and `destroy_infrastructure(provider)`. Wire those to your Terraform orchestration (subprocess calls to `terraform` or a more advanced Python wrapper) to enable real deployments from the GUI.
+- The UI falls back to a simulated deploy/destroy mode when the bridge functions are not implemented, so you can preview the UX in a normal browser by opening `vpn-gui-app/ui/index.html`.
 
 ## Security Notes
 

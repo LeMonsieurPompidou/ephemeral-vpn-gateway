@@ -11,9 +11,7 @@
 <body>
     <div class="app-container">
         <header class="header">
-            <div class="logo-placeholder" aria-hidden="true">
-                <div class="logo-icon"></div>
-            </div>
+            <img class="header-logo" src="./assets/Hérès_VPN_logo.png" alt="Hérès_VPN_logo">
             <h1 class="app-title">Hérès VPN</h1>
         </header>
 
@@ -107,12 +105,12 @@
                 </div>
             </div>
 
-            <div class="status-row status-row-qr">
+            <div class="status-row status-row-qr hidden-section" aria-hidden="true">
                 <span class="status-row-label">WireGuard Config</span>
                 <div class="status-row-content">
                     <div class="qr-frame">
                         <div id="qrcode" class="qrcode" aria-label="WireGuard QR code"></div>
-                        <div class="qr-caption">QRCode.js renders the client config here.</div>
+                        <div class="qr-caption">QR Code for the client config here.</div>
                     </div>
                 </div>
             </div>

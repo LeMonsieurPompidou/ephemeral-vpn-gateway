@@ -63,35 +63,12 @@ body::before {
     margin-bottom: 32px;
 }
 
-.logo-placeholder {
-    width: 52px;
-    height: 52px;
-    border-radius: 16px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+.header-logo {
+    height: 30px;
+    width: auto;
+    display: block;
     flex-shrink: 0;
-    background: linear-gradient(135deg, var(--primary) 0%, #1e40af 100%);
-    box-shadow: 0 14px 30px rgba(37, 99, 235, 0.24);
-}
-
-.logo-icon {
-    width: 26px;
-    height: 26px;
-    position: relative;
-    border-radius: 7px;
-    background: rgba(255, 255, 255, 0.96);
-}
-
-.logo-icon::before {
-    content: '';
-    position: absolute;
-    inset: 50% auto auto 50%;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--primary);
-    transform: translate(-50%, -50%);
+    object-fit: contain;
 }
 
 .app-title {
@@ -148,6 +125,15 @@ body::before {
     background: var(--primary-soft);
     color: var(--primary);
     box-shadow: 0 8px 24px rgba(37, 99, 235, 0.10);
+}
+
+.provider-tab:disabled,
+.provider-tab.is-disabled {
+    opacity: 0.42;
+    cursor: not-allowed;
+    pointer-events: none;
+    transform: none;
+    box-shadow: none;
 }
 
 .form-group {
@@ -404,6 +390,10 @@ body::before {
 
     .header {
         margin-bottom: 24px;
+    }
+
+    .header-logo {
+        height: 24px;
     }
 
     .app-title {

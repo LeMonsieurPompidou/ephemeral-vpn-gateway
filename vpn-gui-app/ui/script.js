@@ -23,9 +23,44 @@ const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const ipAddress = document.getElementById('ip-address');
 const statusCard = document.getElementById('status-card');
+const qrRow = document.querySelector('.status-row-qr');
 const qrContainer = document.getElementById('qrcode');
 
 let deployTimer = null;
+
+function setProviderControlsDisabled(isDisabled) {
+    providerTabs.forEach((tab) => {
+        tab.disabled = isDisabled;
+        tab.classList.toggle('is-disabled', isDisabled);
+    });
+}
+
+function setDeployControlsDisabled(isDisabled) {
+    scalewayDeployBtn.disabled = isDisabled || !scalewayZoneSelect.value;
+    doDeployBtn.disabled = isDisabled || !doRegionSelect.value;
+}
+
+function clearQrCode() {
+    if (qrContainer) {
+        qrContainer.replaceChildren();
+    }
+}
+
+function showQrCodeRow() {
+    if (qrRow) {
+        qrRow.classList.remove('hidden-section');
+        qrRow.setAttribute('aria-hidden', 'false');
+    }
+}
+
+function hideQrCodeRow() {
+    clearQrCode();
+
+    if (qrRow) {
+        qrRow.classList.add('hidden-section');
+        qrRow.setAttribute('aria-hidden', 'true');
+    }
+}
 
 function loadExternalScript(src) {
     return new Promise((resolve, reject) => {
@@ -61,8 +96,7 @@ function setActiveProvider(provider) {
 }
 
 function updateDeployButtons() {
-    scalewayDeployBtn.disabled = !scalewayZoneSelect.value;
-    doDeployBtn.disabled = !doRegionSelect.value;
+    setDeployControlsDisabled(false);
 }
 
 function resetStatus() {
@@ -75,11 +109,19 @@ function resetStatus() {
     statusDot.className = 'status-indicator';
     statusText.textContent = 'Disconnected';
     ipAddress.textContent = '—';
+    hideQrCodeRow();
     scalewayDestroyBtn.disabled = true;
     doDestroyBtn.disabled = true;
+    setProviderControlsDisabled(false);
+    updateDeployButtons();
 }
 
 function simulateDeploy(provider) {
+    setProviderControlsDisabled(true);
+    setDeployControlsDisabled(true);
+    showQrCodeRow();
+    renderQrCode(DEFAULT_WIREGUARD_CONFIG);
+
     statusCard.classList.add('active');
     statusDot.className = 'status-indicator connecting';
     statusText.textContent = 'Connecting...';
@@ -101,9 +143,9 @@ function simulateDeploy(provider) {
 }
 
 function simulateDestroy() {
-    resetStatus();
     scalewayZoneSelect.value = '';
     doRegionSelect.value = '';
+    resetStatus();
     updateDeployButtons();
 }
 
@@ -156,11 +198,21 @@ function initialize() {
     scalewayZoneSelect.addEventListener('change', updateDeployButtons);
     doRegionSelect.addEventListener('change', updateDeployButtons);
     scalewayDeployBtn.addEventListener('click', () => {
+        setProviderControlsDisabled(true);
+        setDeployControlsDisabled(true);
+        showQrCodeRow();
+        renderQrCode(DEFAULT_WIREGUARD_CONFIG);
+
         if (!invokeNativeDeploy('scaleway')) {
             simulateDeploy('scaleway');
         }
     });
     doDeployBtn.addEventListener('click', () => {
+        setProviderControlsDisabled(true);
+        setDeployControlsDisabled(true);
+        showQrCodeRow();
+        renderQrCode(DEFAULT_WIREGUARD_CONFIG);
+
         if (!invokeNativeDeploy('digitalocean')) {
             simulateDeploy('digitalocean');
         }
@@ -176,9 +228,7 @@ function initialize() {
         }
     });
 
-    updateDeployButtons();
     resetStatus();
-    renderQrCode(DEFAULT_WIREGUARD_CONFIG);
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
