@@ -1,14 +1,4 @@
 const QR_CODE_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
-const DEFAULT_WIREGUARD_CONFIG = `[Interface]
-PrivateKey = REPLACE_WITH_CLIENT_PRIVATE_KEY
-Address = 10.8.0.2/32
-DNS = 1.1.1.1
-
-[Peer]
-PublicKey = REPLACE_WITH_SERVER_PUBLIC_KEY
-Endpoint = vpn.example.com:51820
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25`;
 
 const providerTabs = document.querySelectorAll('.provider-tab');
 const scalewaySection = document.getElementById('scaleway-section');
@@ -26,41 +16,8 @@ const statusCard = document.getElementById('status-card');
 const qrRow = document.querySelector('.status-row-qr');
 const qrContainer = document.getElementById('qrcode');
 
-let deployTimer = null;
-
-function setProviderControlsDisabled(isDisabled) {
-    providerTabs.forEach((tab) => {
-        tab.disabled = isDisabled;
-        tab.classList.toggle('is-disabled', isDisabled);
-    });
-}
-
-function setDeployControlsDisabled(isDisabled) {
-    scalewayDeployBtn.disabled = isDisabled || !scalewayZoneSelect.value;
-    doDeployBtn.disabled = isDisabled || !doRegionSelect.value;
-}
-
-function clearQrCode() {
-    if (qrContainer) {
-        qrContainer.replaceChildren();
-    }
-}
-
-function showQrCodeRow() {
-    if (qrRow) {
-        qrRow.classList.remove('hidden-section');
-        qrRow.setAttribute('aria-hidden', 'false');
-    }
-}
-
-function hideQrCodeRow() {
-    clearQrCode();
-
-    if (qrRow) {
-        qrRow.classList.add('hidden-section');
-        qrRow.setAttribute('aria-hidden', 'true');
-    }
-}
+let activeProvider = 'scaleway';
+let operationInFlight = false;
 
 function loadExternalScript(src) {
     return new Promise((resolve, reject) => {
@@ -87,6 +44,8 @@ function loadExternalScript(src) {
 }
 
 function setActiveProvider(provider) {
+    activeProvider = provider;
+
     providerTabs.forEach((tab) => {
         tab.classList.toggle('active', tab.dataset.provider === provider);
     });
@@ -95,79 +54,42 @@ function setActiveProvider(provider) {
     digitaloceanSection.classList.toggle('hidden-section', provider !== 'digitalocean');
 }
 
+function setProviderControlsDisabled(isDisabled) {
+    providerTabs.forEach((tab) => {
+        tab.disabled = isDisabled;
+        tab.classList.toggle('is-disabled', isDisabled);
+    });
+}
+
 function updateDeployButtons() {
-    setDeployControlsDisabled(false);
+    scalewayDeployBtn.disabled = operationInFlight || !scalewayZoneSelect.value;
+    doDeployBtn.disabled = operationInFlight || !doRegionSelect.value;
 }
 
-function resetStatus() {
-    if (deployTimer) {
-        clearTimeout(deployTimer);
-        deployTimer = null;
+function clearQrCode() {
+    if (qrContainer) {
+        qrContainer.replaceChildren();
+    }
+}
+
+function showQrCodeRow() {
+    if (!qrRow) {
+        return;
     }
 
-    statusCard.classList.remove('active');
-    statusDot.className = 'status-indicator';
-    statusText.textContent = 'Disconnected';
-    ipAddress.textContent = '—';
-    hideQrCodeRow();
-    scalewayDestroyBtn.disabled = true;
-    doDestroyBtn.disabled = true;
-    setProviderControlsDisabled(false);
-    updateDeployButtons();
+    qrRow.classList.remove('hidden-section');
+    qrRow.setAttribute('aria-hidden', 'false');
 }
 
-function simulateDeploy(provider) {
-    setProviderControlsDisabled(true);
-    setDeployControlsDisabled(true);
-    showQrCodeRow();
-    renderQrCode(DEFAULT_WIREGUARD_CONFIG);
+function hideQrCodeRow() {
+    clearQrCode();
 
-    statusCard.classList.add('active');
-    statusDot.className = 'status-indicator connecting';
-    statusText.textContent = 'Connecting...';
-    ipAddress.textContent = '—';
-
-    const destroyBtn = provider === 'scaleway' ? scalewayDestroyBtn : doDestroyBtn;
-    destroyBtn.disabled = false;
-
-    if (deployTimer) {
-        clearTimeout(deployTimer);
+    if (!qrRow) {
+        return;
     }
 
-    deployTimer = window.setTimeout(() => {
-        statusDot.className = 'status-indicator connected';
-        statusText.textContent = 'Connected';
-        ipAddress.textContent = '203.0.113.42';
-        deployTimer = null;
-    }, 2000);
-}
-
-function simulateDestroy() {
-    scalewayZoneSelect.value = '';
-    doRegionSelect.value = '';
-    resetStatus();
-    updateDeployButtons();
-}
-
-function invokeNativeDeploy(provider) {
-    const region = provider === 'scaleway' ? scalewayZoneSelect.value : doRegionSelect.value;
-    const nativeApi = window.pywebview?.api;
-
-    if (nativeApi?.deploy) {
-        return Boolean(nativeApi.deploy(provider, region));
-    }
-
-    return false;
-}
-
-function invokeNativeDestroy(provider) {
-    const nativeApi = window.pywebview?.api;
-
-    if (nativeApi?.destroy) {
-        return Boolean(nativeApi.destroy(provider));
-    }
-
-    return false;
+    qrRow.classList.add('hidden-section');
+    qrRow.setAttribute('aria-hidden', 'true');
 }
 
 function renderQrCode(configText) {
@@ -190,6 +112,147 @@ function renderQrCode(configText) {
     });
 }
 
+function resetStatus() {
+    statusCard.classList.remove('active');
+    statusDot.className = 'status-indicator';
+    statusText.textContent = 'Disconnected';
+    ipAddress.textContent = '—';
+    hideQrCodeRow();
+    setProviderControlsDisabled(false);
+    scalewayDestroyBtn.disabled = false;
+    doDestroyBtn.disabled = false;
+    updateDeployButtons();
+}
+
+function setConnectingState() {
+    statusCard.classList.add('active');
+    statusDot.className = 'status-indicator connecting';
+    statusText.textContent = 'Connecting...';
+    ipAddress.textContent = '—';
+    showQrCodeRow();
+    clearQrCode();
+}
+
+function setConnectedState(ip, configText) {
+    statusCard.classList.add('active');
+    statusDot.className = 'status-indicator connected';
+    statusText.textContent = 'Connected';
+    ipAddress.textContent = ip;
+    showQrCodeRow();
+    renderQrCode(configText);
+}
+
+function extractErrorMessage(resultOrError) {
+    if (!resultOrError) {
+        return 'Unknown error';
+    }
+
+    if (resultOrError instanceof Error) {
+        return resultOrError.message;
+    }
+
+    if (typeof resultOrError === 'object' && 'message' in resultOrError && resultOrError.message) {
+        return String(resultOrError.message);
+    }
+
+    return String(resultOrError);
+}
+
+async function invokeNativeDeploy(provider) {
+    const nativeApi = window.pywebview?.api;
+
+    if (!nativeApi?.deploy) {
+        throw new Error('Native deploy API is not available');
+    }
+
+    const region = provider === 'scaleway' ? scalewayZoneSelect.value : doRegionSelect.value;
+    return await nativeApi.deploy(provider, region);
+}
+
+async function invokeNativeDestroy(provider) {
+    const nativeApi = window.pywebview?.api;
+
+    if (!nativeApi?.destroy) {
+        throw new Error('Native destroy API is not available');
+    }
+
+    return await nativeApi.destroy(provider);
+}
+
+async function handleDeploy(provider) {
+    if (operationInFlight) {
+        return;
+    }
+
+    operationInFlight = true;
+    setProviderControlsDisabled(true);
+    updateDeployButtons();
+    scalewayDestroyBtn.disabled = true;
+    doDestroyBtn.disabled = true;
+    setConnectingState();
+
+    try {
+        const result = await invokeNativeDeploy(provider);
+
+        if (result && result.status === 'success') {
+            if (!result.ip || !result.config) {
+                throw new Error('Deploy response missing ip or config');
+            }
+
+            setConnectedState(result.ip, result.config);
+            scalewayDestroyBtn.disabled = false;
+            doDestroyBtn.disabled = false;
+            return;
+        }
+
+        throw new Error(extractErrorMessage(result) || 'Deployment failed');
+    } catch (error) {
+        const message = extractErrorMessage(error);
+        console.error('Deployment failed:', message, error);
+        alert(message);
+        resetStatus();
+    } finally {
+        operationInFlight = false;
+        setProviderControlsDisabled(false);
+        updateDeployButtons();
+    }
+}
+
+async function handleDestroy(provider) {
+    if (operationInFlight) {
+        return;
+    }
+
+    operationInFlight = true;
+    setProviderControlsDisabled(true);
+    updateDeployButtons();
+
+    try {
+        const result = await invokeNativeDestroy(provider);
+
+        if (!result || result.status !== 'success') {
+            throw new Error(extractErrorMessage(result) || 'Destroy failed');
+        }
+
+        if (provider === 'scaleway') {
+            scalewayZoneSelect.value = '';
+        } else {
+            doRegionSelect.value = '';
+        }
+
+        resetStatus();
+    } catch (error) {
+        const message = extractErrorMessage(error);
+        console.error('Destroy failed:', message, error);
+        alert(message);
+        resetStatus();
+    } finally {
+        operationInFlight = false;
+        setProviderControlsDisabled(false);
+        updateDeployButtons();
+    }
+}
+
 function initialize() {
     providerTabs.forEach((tab) => {
         tab.addEventListener('click', () => setActiveProvider(tab.dataset.provider));
@@ -197,37 +260,44 @@ function initialize() {
 
     scalewayZoneSelect.addEventListener('change', updateDeployButtons);
     doRegionSelect.addEventListener('change', updateDeployButtons);
+
     scalewayDeployBtn.addEventListener('click', () => {
-        setProviderControlsDisabled(true);
-        setDeployControlsDisabled(true);
-        showQrCodeRow();
-        renderQrCode(DEFAULT_WIREGUARD_CONFIG);
-
-        if (!invokeNativeDeploy('scaleway')) {
-            simulateDeploy('scaleway');
-        }
+        handleDeploy('scaleway').catch((error) => {
+            const message = extractErrorMessage(error);
+            console.error('Deployment failed:', message, error);
+            alert(message);
+            resetStatus();
+        });
     });
+
     doDeployBtn.addEventListener('click', () => {
-        setProviderControlsDisabled(true);
-        setDeployControlsDisabled(true);
-        showQrCodeRow();
-        renderQrCode(DEFAULT_WIREGUARD_CONFIG);
-
-        if (!invokeNativeDeploy('digitalocean')) {
-            simulateDeploy('digitalocean');
-        }
+        handleDeploy('digitalocean').catch((error) => {
+            const message = extractErrorMessage(error);
+            console.error('Deployment failed:', message, error);
+            alert(message);
+            resetStatus();
+        });
     });
+
     scalewayDestroyBtn.addEventListener('click', () => {
-        if (!invokeNativeDestroy('scaleway')) {
-            simulateDestroy();
-        }
-    });
-    doDestroyBtn.addEventListener('click', () => {
-        if (!invokeNativeDestroy('digitalocean')) {
-            simulateDestroy();
-        }
+        handleDestroy('scaleway').catch((error) => {
+            const message = extractErrorMessage(error);
+            console.error('Destroy failed:', message, error);
+            alert(message);
+            resetStatus();
+        });
     });
 
+    doDestroyBtn.addEventListener('click', () => {
+        handleDestroy('digitalocean').catch((error) => {
+            const message = extractErrorMessage(error);
+            console.error('Destroy failed:', message, error);
+            alert(message);
+            resetStatus();
+        });
+    });
+
+    setActiveProvider(activeProvider);
     resetStatus();
 }
 
