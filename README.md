@@ -6,19 +6,20 @@
 ![WireGuard](https://img.shields.io/badge/VPN-WireGuard-1C1C1C?logo=wireguard&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-Ephemeral VPN Gateway is a fully automated, multi-cloud Terraform project for deploying short-lived WireGuard VPN gateways on demand. It supports both Scaleway in Europe and DigitalOcean globally, giving you a fast, repeatable way to spin up a private egress tunnel, browse securely, and tear everything down when you are done.
+Ephemeral VPN Gateway is a multi-cloud, short-lived WireGuard deployment toolkit built around Terraform and a native Python desktop app. It can provision VPN gateways on Scaleway or DigitalOcean, generate client configs and QR codes, and tear everything down as soon as you are done.
 
-The design is intentionally ephemeral: create the gateway only when you need it, pay for the brief runtime you actually use, and destroy it immediately after the session ends. Terraform generates the WireGuard key material, provisions the cloud instance, and delivers ready-to-import client configurations and mobile QR codes directly to your Windows Desktop.
+The project ships with a real desktop GUI that connects directly to the Terraform orchestration layer. You can launch the app, choose a cloud stack and location, and watch the interface update with the live public IP and the actual WireGuard QR code generated from the deployed infrastructure.
 
 ## Key Features
 
+- Native desktop GUI for a simple point-and-click deployment flow.
 - Multi-cloud support for Scaleway and DigitalOcean.
-- Ephemeral, pay-per-minute infrastructure that is meant to be created and destroyed on demand.
-- Secure WireGuard tunneling with server and client key generation handled by Terraform.
-- Automatic desktop delivery of client configuration files for laptop usage.
-- Dynamic HTML and JavaScript QR code generation for mobile WireGuard clients.
-- Clean separation between European and global deployment targets.
-- PowerShell-friendly automation for quick deploy and destroy workflows.
+- Real Terraform orchestration through the Python bridge layer.
+- Live status updates, including deployment progress, public IP, and connected state.
+- Native WireGuard QR code rendering directly inside the app.
+- Desktop-delivered client configuration files for laptop import.
+- Ephemeral infrastructure designed to be deployed only when needed and destroyed immediately after use.
+- Advanced terminal workflows for users who prefer automation scripts or headless environments.
 
 ## Project Architecture
 
@@ -40,10 +41,11 @@ ephemeral-vpn-gateway/
         ├── style.css
         ├── script.js
         └── assets/
-            └── Heres_VPN_logo.png
+            ├── Hérès_VPN_logo.png
+            └── Hérès_VPN_logo.ico
 ```
 
-Each folder is a self-contained Terraform root module. The Scaleway module targets European zones, while the DigitalOcean module targets global regions such as New York, Amsterdam, Frankfurt, London, and others.
+Each Terraform directory is a self-contained root module. The Scaleway module targets European zones, while the DigitalOcean module targets global regions such as New York, Amsterdam, Frankfurt, London, Singapore, and more.
 
 ## Prerequisites
 
@@ -52,9 +54,7 @@ Each folder is a self-contained Terraform root module. The Scaleway module targe
 - A Scaleway account with API credentials if you want to use the European deployment.
 - A DigitalOcean account with an API token if you want to use the global deployment.
 - A local SSH key pair, typically `~/.ssh/id_ed25519` and `~/.ssh/id_ed25519.pub`.
-- Windows PowerShell for the automation shortcuts and day-to-day operations.
-
-Note: the repository now contains a small Python-based GUI that wraps the existing Terraform modules. See "How to Run the GUI" below.
+- Windows PowerShell for the optional automation shortcuts.
 
 ## Configuration
 
@@ -75,11 +75,50 @@ do_token     = "YOUR_DIGITALOCEAN_TOKEN"
 ssh_key_name = "YOUR_SSH_KEY_NAME"
 ```
 
-## Advanced Automation (PowerShell Shortcuts)
+## Deployment & Operation Workflows
 
-On Windows, the fastest workflow is to load a few helper functions into your PowerShell profile. This lets you deploy and destroy either cloud environment with a short command instead of repeatedly typing long Terraform invocations.
+### 1. Standalone Desktop GUI Workflow (Recommended)
 
-Open your profile with:
+This is the preferred workflow for end-users who want a seamless point-and-click experience.
+
+**Prerequisites and setup**
+
+- Install or run `Hérès_VPN.exe`.
+- Confirm that the Scaleway or DigitalOcean credentials are already configured in the matching Terraform module.
+- Ensure the local SSH key pair exists if your selected provider requires it.
+
+**Deploy (ON)**
+
+1. Start `Hérès_VPN.exe`.
+2. Select either `Scaleway Stack` or `DigitalOcean Stack`.
+3. Choose a region or zone from the provider-specific dropdown.
+4. Click `Deploy VPN`.
+5. Watch the status card animate to `Connecting...` and then `Connected`.
+6. Review the live public IP that appears in the interface.
+7. Scan the native WireGuard QR code rendered directly on screen.
+
+**Destroy (OFF)**
+
+Press `Destroy VPN` inside the interface to fully tear down the cloud resources.
+
+**Technical note: packaging the GUI**
+
+Rebuild the standalone executable from the repository root with PyInstaller using these exact commands:
+
+```bash
+pip install --upgrade pyinstaller pyinstaller-hooks-contrib pywebview
+pyinstaller --onefile --noconsole --name "Hérès_VPN" --icon "vpn-gui-app\ui\assets\Hérès_VPN_logo.ico" --add-data "vpn-gui-app\ui;ui" --add-data "vpn-scaleway;vpn-scaleway" --add-data "vpn-digitalocean;vpn-digitalocean" "vpn-gui-app\app.py"
+```
+
+The compiled artifact is `Hérès_VPN.exe`.
+
+### 2. Automated PowerShell Workflows (Windows Terminal)
+
+This workflow is ideal for local terminal users who prefer profile automation shortcuts.
+
+**Prerequisites and setup**
+
+Open your PowerShell profile with:
 
 ```powershell
 notepad $PROFILE
@@ -96,7 +135,7 @@ Add the following shortcuts to your profile:
 ```powershell
 # ==============================================================================
 # UNIVERSAL EPHEMERAL VPN GATEWAY SHORTCUTS
-# ==============================================================================
+# ======================================================================
 
 # --- DIGITALOCEAN SHORTCUTS ---
 # Available regions: nyc1, nyc3 (US East), sfo2, sfo3 (US West), ams3 (NL), fra1 (DE), lon1 (UK), sgp1 (SG), blr1 (IN), tor1 (CA)
@@ -117,7 +156,7 @@ function vpn-do-off {
 # Available zones: fr-par-1 (FR), fr-par-2 (FR), fr-par-3 (FR), nl-ams-1 (NL), nl-ams-2 (NL), nl-ams-3 (NL), pl-waw-1 (PL), pl-waw-2 (PL), pl-waw-3 (PL), it-mil-1 (IT)
 function vpn-sw-on {
     param ([string]$Region = "fr-par-1")
-    Write-Host "Deploying Scaleway VPN in region: [$Region]..." -ForegroundColor Cyan
+    Write-Host "Deploying Scaleway VPN in zone: [$Region]..." -ForegroundColor Cyan
     Set-Location -Path "~\Documents\GitHub\ephemeral-vpn-gateway\vpn-scaleway"
     terraform plan -var="region=$Region" -out=tfplan
     terraform apply tfplan
@@ -129,42 +168,7 @@ function vpn-sw-off {
 }
 ```
 
-## How to Use
-
-The intended workflow is simple:
-
-1. Load your PowerShell profile and open a new shell.
-2. Deploy the cloud you want with the matching shortcut.
-3. Import the generated desktop configuration into WireGuard.
-4. Scan the generated QR code on your phone if you want mobile access.
-5. Browse securely through the ephemeral tunnel.
-6. Destroy the infrastructure when the session is over.
-
-### Standard CLI Method
-
-If you prefer not to use the PowerShell shortcuts, use the standard Terraform workflow directly from the module directory.
-
-First, clone the repository and enter the workspace:
-
-```bash
-git clone <repo_url>
-cd ephemeral-vpn-gateway
-```
-
-Then run the Terraform commands from the module you want to deploy.
-
-**Terraform commands only:**
-
-```bash
-# Standard Terraform workflow
-cd vpn-digitalocean
-terraform init
-terraform apply -var="region=lon1"
-# To destroy manually:
-terraform destroy -var="region=lon1"
-```
-
-**PowerShell shortcuts:**
+**Deploy (ON)**
 
 For example, to launch a DigitalOcean gateway in San Francisco:
 
@@ -172,81 +176,67 @@ For example, to launch a DigitalOcean gateway in San Francisco:
 vpn-do-on sfo3
 ```
 
-Then open the generated desktop client file, import it into WireGuard, and scan the HTML QR code on your phone if you want a mobile client. When you are done, shut the gateway down with:
+**Destroy (OFF)**
+
+When you are done, shut it down with:
 
 ```powershell
 vpn-do-off
 ```
 
-The same pattern works for Scaleway in Europe, using zone names only:
+The same pattern works for Scaleway in Europe:
 
 ```powershell
 vpn-sw-on fr-par-1
 vpn-sw-off
 ```
 
-## How to Destroy (Important)
+### 3. Standard Infrastructure-as-Code CLI Workflow (Cross-Platform)
 
-This infrastructure is intentionally ephemeral. If you leave a droplet or instance running, the cloud provider will continue billing you for every minute it stays alive.
+This workflow is ideal for headless servers, Linux/macOS operators, or CI/CD runners.
 
-Always destroy the environment when you are finished:
+**Prerequisites and setup**
 
-```powershell
-vpn-do-off
-vpn-sw-off
+- Clone the repository and enter the workspace.
+- Make sure the matching `terraform.tfvars` file exists in the provider directory.
+- Confirm your cloud credentials and local SSH key are available.
+
+```bash
+git clone <repo_url>
+cd ephemeral-vpn-gateway
 ```
 
-If you are using the standard CLI workflow, run `terraform destroy` in the matching module directory and confirm the prompt. Destroying the gateway is not optional for cost control; it is the mechanism that stops billing.
+**Deploy (ON)**
+
+DigitalOcean example:
+
+```bash
+cd vpn-digitalocean
+terraform init
+terraform apply -var="region=lon1"
+```
+
+Scaleway example:
+
+```bash
+cd vpn-scaleway
+terraform init
+terraform apply -var="region=fr-par-1"
+```
+
+**Destroy (OFF)**
+
+To clean up manually, run:
+
+```bash
+terraform destroy -auto-approve
+```
+
+Use that command in the same module directory you deployed from, whether it is `vpn-digitalocean` or `vpn-scaleway`.
 
 ## Cost Optimization
 
-This project is built for short-lived sessions, not permanent uptime. The `*-off` commands destroy the gateway immediately, which stops billing for the compute instance and keeps total cost to fractions of a cent per session in practice. That makes the setup ideal for temporary privacy, travel, testing, and one-off regional access.
-
-## What Gets Generated
-
-During deployment, Terraform writes the client artifacts directly to your Windows Desktop:
-
-- Laptop WireGuard configuration file.
-- Phone QR code HTML file with embedded QRCode.js.
-
-## GUI Application
-
-Hérès VPN includes a lightweight desktop GUI that provides an approachable, one-click workflow for deploying the same Terraform modules.
-
-- The GUI is located under the `vpn-gui-app/` folder and launches a local Web UI inside a native window using `pywebview`.
-- The front-end supports:
-    - Multi-provider toggle: switch between `Scaleway` and `DigitalOcean` stacks.
-    - Dynamic location selection based on provider (zones / regions dropdown).
-    - One-click `Deploy VPN` and `Destroy VPN` actions (these currently call the bridge hooks that you can implement to invoke Terraform).
-    - Real-time status area showing connection state, public IP, and a dynamically rendered WireGuard QR Code for mobile import.
-
-### How to Run the GUI (local development)
-
-1. Create and activate a Python virtual environment (recommended):
-
-```bash
-python -m venv .venv
-# Windows PowerShell
-.\.venv\Scripts\Activate.ps1
-# or Command Prompt
-.\.venv\Scripts\activate.bat
-```
-
-2. Install dependencies (this project uses `pywebview` for the native window):
-
-```bash
-pip install pywebview
-```
-
-3. Launch the app from the repository root:
-
-```bash
-python vpn-gui-app/app.py
-```
-
-Notes:
-- `vpn-gui-app/bridge.py` contains two placeholder functions: `deploy_infrastructure(provider, region)` and `destroy_infrastructure(provider)`. Wire those to your Terraform orchestration (subprocess calls to `terraform` or a more advanced Python wrapper) to enable real deployments from the GUI.
-- The UI falls back to a simulated deploy/destroy mode when the bridge functions are not implemented, so you can preview the UX in a normal browser by opening `vpn-gui-app/ui/index.html`.
+This project is designed for short-lived sessions, not permanent uptime. Destroying the gateway immediately after use keeps the total cost low and makes the setup suitable for temporary privacy, travel, testing, and one-off regional access.
 
 ## Security Notes
 
@@ -259,7 +249,7 @@ Notes:
 
 - If Terraform reports missing variables, confirm that the correct `terraform.tfvars` file exists in the target module directory.
 - If a client cannot resolve DNS, ensure the generated client file uses the intended public DNS resolver.
-- If a deployment fails immediately after boot, wait for cloud-init to finish and re-run the health checks from the module-specific notes.
+- If a deployment fails immediately after boot, wait for cloud-init to finish and try again.
 - If SSH host key warnings appear, clear the old entry from `known_hosts` because the infrastructure is intentionally ephemeral.
 
 ## License
