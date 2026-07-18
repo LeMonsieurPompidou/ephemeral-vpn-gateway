@@ -1,120 +1,43 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="color-scheme" content="light">
-    <title>Hérès VPN - Settings</title>
-    <link rel="stylesheet" href="style.css">
-    <script src="script.js" defer></script>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light">
+  <title>Hérès VPN</title><link rel="stylesheet" href="style.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script><script src="script.js" defer></script>
 </head>
 <body>
-    <div class="app-container">
-        <header class="header">
-            <img class="header-logo" src="./assets/Hérès_VPN_logo.png" alt="Hérès_VPN_logo">
-            <h1 class="app-title">Hérès VPN</h1>
-        </header>
-
-        <section class="section">
-            <div class="section-title">Provider</div>
-            <div class="provider-tabs" role="tablist" aria-label="Cloud provider selection">
-                <button class="provider-tab active" data-provider="scaleway" type="button">
-                    Scaleway Stack
-                </button>
-                <button class="provider-tab" data-provider="digitalocean" type="button">
-                    DigitalOcean Stack
-                </button>
-            </div>
-        </section>
-
-        <section id="scaleway-section" class="section">
-            <div class="form-group">
-                <label class="form-label" for="scaleway-zone">Zone</label>
-                <div class="dropdown-wrapper">
-                    <select id="scaleway-zone" class="dropdown-select">
-                        <option value="">Select a zone...</option>
-                        <option value="paris-1">Paris, France, zone 1</option>
-                        <option value="paris-2">Paris, France, zone 2</option>
-                        <option value="paris-3">Paris, France, zone 3</option>
-                        <option value="amsterdam-1">Amsterdam, Netherlands, zone 1</option>
-                        <option value="amsterdam-2">Amsterdam, Netherlands, zone 2</option>
-                        <option value="amsterdam-3">Amsterdam, Netherlands, zone 3</option>
-                        <option value="warsaw-1">Warsaw, Poland, zone 1</option>
-                        <option value="warsaw-2">Warsaw, Poland, zone 2</option>
-                        <option value="warsaw-3">Warsaw, Poland, zone 3</option>
-                        <option value="milan">Milan, Italy</option>
-                    </select>
-                    <div class="chevron-icon" aria-hidden="true"></div>
-                </div>
-            </div>
-
-            <div class="action-buttons">
-                <button class="btn btn-primary" id="scaleway-deploy" disabled type="button">
-                    Deploy VPN
-                </button>
-                <button class="btn btn-destructive" id="scaleway-destroy" disabled type="button">
-                    Destroy VPN
-                </button>
-            </div>
-        </section>
-
-        <section id="digitalocean-section" class="section hidden-section">
-            <div class="form-group">
-                <label class="form-label" for="do-region">Region</label>
-                <div class="dropdown-wrapper">
-                    <select id="do-region" class="dropdown-select">
-                        <option value="">Select a region...</option>
-                        <option value="nyc1">New York, USA, zone 1</option>
-                        <option value="nyc3">New York, USA, zone 2</option>
-                        <option value="sfo1">San Francisco, USA, zone 1</option>
-                        <option value="sfo3">San Francisco, USA, zone 2</option>
-                        <option value="ams3">Amsterdam, Netherlands</option>
-                        <option value="fra1">Frankfurt, Germany</option>
-                        <option value="lon1">London, United Kingdom</option>
-                        <option value="sgp1">Singapore</option>
-                        <option value="blr1">Bangalore, India</option>
-                        <option value="tor1">Toronto, Canada</option>
-                    </select>
-                    <div class="chevron-icon" aria-hidden="true"></div>
-                </div>
-            </div>
-
-            <div class="action-buttons">
-                <button class="btn btn-primary" id="do-deploy" disabled type="button">
-                    Deploy VPN
-                </button>
-                <button class="btn btn-destructive" id="do-destroy" disabled type="button">
-                    Destroy VPN
-                </button>
-            </div>
-        </section>
-
-        <section id="status-card" class="status-card">
-            <div class="status-header">
-                <div class="status-indicator" id="status-dot"></div>
-                <div>
-                    <div class="status-label">VPN Status</div>
-                    <div class="status-value" id="status-text">Disconnected</div>
-                </div>
-            </div>
-
-            <div class="status-row">
-                <span class="status-row-label">Public IP Address</span>
-                <div class="status-row-content">
-                    <div class="ip-address" id="ip-address">—</div>
-                </div>
-            </div>
-
-            <div class="status-row status-row-qr hidden-section" aria-hidden="true">
-                <span class="status-row-label">WireGuard Config</span>
-                <div class="status-row-content">
-                    <div class="qr-frame">
-                        <div id="qrcode" class="qrcode" aria-label="WireGuard QR code"></div>
-                        <div class="qr-caption">QR Code for the client config here.</div>
-                    </div>
-                </div>
-            </div>
-        </section>
+<main class="app-container">
+  <header class="header"><img class="header-logo" src="assets/Hérès_VPN_logo.png" alt=""><div><h1 class="app-title">Hérès VPN</h1><p class="subtitle">Ephemeral WireGuard gateways</p></div></header>
+  <aside class="notice">Cloud IP addresses are datacenter addresses. They are not guaranteed to work with services that block VPNs or cloud networks. “Tested” appears only when explicitly recorded in the catalog.</aside>
+  <section class="section">
+    <h2 class="section-title">Gateway</h2>
+    <div class="form-grid">
+      <label>Provider<select id="provider"></select></label>
+      <label>Country<select id="country"></select></label>
+      <label>City / region<select id="location"></select></label>
     </div>
-</body>
-</html>
+    <div class="badges"><span id="server-type" class="badge">cloud</span><span id="streaming" class="badge muted">unverified</span><span id="cost" class="badge muted">Cost unavailable</span></div>
+  </section>
+  <details class="section"><summary>Network and lifetime options</summary>
+    <div class="form-grid options">
+      <label>Traffic mode<select id="traffic-mode"><option value="ipv4">IPv4 full tunnel</option><option value="custom">Custom AllowedIPs</option></select></label>
+      <label>Custom AllowedIPs<input id="allowed-ips" value="0.0.0.0/0" disabled></label>
+      <label>DNS servers<input id="dns" value="1.1.1.1, 1.0.0.1"></label>
+      <label>WireGuard port<input id="port" type="number" value="51820" min="1" max="65535"></label>
+      <label>Client MTU<input id="mtu" type="number" value="1420" min="576" max="9000"></label>
+      <label>Keepalive (seconds)<input id="keepalive" type="number" value="25" min="0"></label>
+      <label>SSH source CIDR<input id="ssh-cidr" value="127.0.0.1/32"></label>
+      <label>Automatic expiration<select id="expiration"><option value="">Disabled</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="240">4 hours</option><option value="480">8 hours</option></select></label>
+    </div>
+  </details>
+  <section id="recovery" class="section hidden"><h2 class="section-title">Recovery</h2><p>These deployments may still own billable resources.</p><div id="recovery-list"></div></section>
+  <section class="section actions"><button id="deploy" class="btn btn-primary">Deploy VPN</button><button id="cancel" class="btn" disabled>Cancel</button><button id="destroy" class="btn btn-destructive" disabled>Destroy VPN</button></section>
+  <section id="status-card" class="status-card">
+    <div class="status-header"><div id="status-dot" class="status-indicator"></div><div><strong id="status-text">Idle</strong><div id="elapsed" class="muted-text">00:00</div></div></div>
+    <ol id="steps" class="steps"></ol>
+    <div class="status-row"><span>Public IP</span><span><code id="ip-address">—</code> <button id="copy-ip" class="link-btn" disabled>Copy</button></span></div>
+    <div class="status-row"><span>Expires</span><span id="expires">—</span></div>
+    <div id="qr-row" class="status-row hidden"><span>Client configuration</span><div><div id="qrcode" class="qrcode"></div><button id="save-config" class="link-btn">Save configuration</button></div></div>
+    <details><summary>Live non-sensitive logs</summary><pre id="logs" class="logs"></pre></details>
+  </section>
+</main>
+</body></html>

@@ -1,26 +1,26 @@
 variable "region" {
-  description = "DigitalOcean region slug"
+  description = "AWS region"
   type        = string
-  default     = "nyc3"
+  default     = "us-east-1"
 }
-variable "do_token" {
-  description = "Legacy token input; prefer DIGITALOCEAN_TOKEN"
+variable "instance_type" {
+  description = "Lightsail bundle ID"
+  type        = string
+  default     = "nano_3_0"
+}
+variable "availability_zone_suffix" {
+  description = "Availability zone suffix"
+  type        = string
+  default     = "a"
+}
+variable "ssh_key_pair_name" {
+  description = "Optional existing Lightsail key pair name"
   type        = string
   default     = null
   nullable    = true
-  sensitive   = true
-}
-variable "instance_type" {
-  description = "Droplet size slug"
-  type        = string
-  default     = "s-1vcpu-1gb"
-}
-variable "ssh_key_name" {
-  description = "Existing DigitalOcean SSH key name"
-  type        = string
 }
 variable "ssh_allowed_cidr" {
-  description = "CIDR allowed to connect over SSH"
+  description = "IPv4 CIDR allowed to connect over SSH"
   type        = string
   default     = "127.0.0.1/32"
 }

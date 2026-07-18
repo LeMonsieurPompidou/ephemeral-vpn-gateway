@@ -44,13 +44,29 @@ tfplan
 .terraformrc
 terraform.rc
 .terraform/
-.terraform.lock.hcl
 
 # PyInstaller compilation artifacts
 build/
 dist/
 *.spec
+!Hérès_VPN.spec
 
 # Python bytecode caches
 __pycache__/
 *.pyc
+
+# Runtime and generated VPN secrets
+runtime/
+*.conf
+*.key
+*.privatekey
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Explicit plan/state variants
+*.tfplan
+*.tfstate.backup

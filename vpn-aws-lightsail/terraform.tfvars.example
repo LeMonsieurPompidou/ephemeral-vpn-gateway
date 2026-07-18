@@ -1,0 +1,8 @@
+region             = "us-east-1"
+instance_type      = "nano_3_0"
+ssh_key_pair_name  = "YOUR_OPTIONAL_LIGHTSAIL_KEY_PAIR"
+ssh_allowed_cidr   = "YOUR_PUBLIC_IP/32"
+wireguard_port     = 51820
+server_private_key = "PLACEHOLDER_PRIVATE_KEY"
+server_public_key  = "PLACEHOLDER_PUBLIC_KEY"
+client_public_key  = "PLACEHOLDER_CLIENT_PUBLIC_KEY"

@@ -1,0 +1,8 @@
+region              = "fr-par-1"
+instance_type       = "PLAY2-MICRO"
+ssh_public_key_path = "~/.ssh/id_ed25519.pub"
+ssh_allowed_cidr    = "YOUR_PUBLIC_IP/32"
+wireguard_port      = 51820
+server_private_key  = "PLACEHOLDER_PRIVATE_KEY"
+server_public_key   = "PLACEHOLDER_PUBLIC_KEY"
+client_public_key   = "PLACEHOLDER_CLIENT_PUBLIC_KEY"
