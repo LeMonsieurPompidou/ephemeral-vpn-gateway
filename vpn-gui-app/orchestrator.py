@@ -1,29 +1,50 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 import socket
 import subprocess
 import threading
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, ContextManager
 
 from catalog import ProviderCatalog
+from file_lock import FileLock
 from models import DeploymentOptions, DeploymentRecord, DeploymentState, StatusEvent, now_iso
+from networking import PublicIpDetectionError, detect_public_ipv4, normalize_public_ipv4_cidr
+from output_contract import ProviderOutputs, validate_provider_outputs
 from providers import ProviderRegistry
 from runtime_registry import DeploymentRegistry
-from security import generate_wireguard_keypair, redact, write_secret
-from terraform_runner import TerraformCancelled, TerraformError, TerraformRunner, output_value
+from security import append_redacted_log, generate_ssh_keypair, generate_wireguard_keypair, redact, write_secret
+from terraform_runner import TerraformCancelled, TerraformError, TerraformRunner
 from validation import validate_options
 
 EventCallback = Callable[[StatusEvent], None]
 LogCallback = Callable[[str, str], None]
+IpDetector = Callable[[], str]
+LEGACY_STATE_NAMES = ("terraform.tfstate", "terraform.tfstate.backup")
+PROVIDER_RESOURCE_PREFIXES = {
+    "aws-lightsail": "aws_lightsail_",
+    "digitalocean": "digitalocean_",
+    "scaleway": "scaleway_",
+}
 
 
 class Orchestrator:
-    def __init__(self, resource_root: Path, runtime_root: Path, runner: TerraformRunner | None = None) -> None:
+    def __init__(
+        self,
+        resource_root: Path,
+        runtime_root: Path,
+        runner: TerraformRunner | None = None,
+        *,
+        ip_detector: IpDetector = detect_public_ipv4,
+        readiness_timeout: float = 300,
+    ) -> None:
         self.resource_root = resource_root.resolve()
         self.runtime_root = runtime_root.resolve()
         self.runtime_root.mkdir(parents=True, exist_ok=True)
@@ -31,10 +52,15 @@ class Orchestrator:
         self.providers = ProviderRegistry(self.catalog)
         self.deployments = DeploymentRegistry(self.runtime_root / "deployments.json")
         self.runner = runner or TerraformRunner()
+        self.ip_detector = ip_detector
+        self.readiness_timeout = readiness_timeout
         self._cancellations: dict[str, threading.Event] = {}
         self._events: list[StatusEvent] = []
         self.on_event: EventCallback | None = None
         self.on_log: LogCallback | None = None
+
+    def new_deployment_id(self) -> str:
+        return str(uuid.uuid4())
 
     def list_providers(self) -> list[dict[str, object]]:
         return [provider.info.to_dict() for provider in self.providers.list()]
@@ -50,42 +76,73 @@ class Orchestrator:
         provider = self.providers.get(provider_id)
         if not provider.info.terraform_root:
             raise ValueError(f"Provider {provider_id} is not Terraform-provisioned")
-        directory = self.resource_root / provider.info.terraform_root
-        if not directory.is_dir() or directory.resolve().parent != self.resource_root:
-            raise TerraformError("Provider Terraform directory is missing or outside the application resources")
-        runtime = self.runtime_root / (deployment_id or f"init-{provider_id}")
+        directory = self._provider_directory(provider_id)
+        identifier = deployment_id or f"init-{provider_id}"
+        runtime = (self.runtime_root / identifier).resolve()
         runtime.mkdir(parents=True, exist_ok=True)
+        state_path = runtime / "terraform.tfstate"
+        self._assert_scoped_path(runtime, state_path)
+        snapshot = self._source_state_snapshot(directory)
         result = self.runner.run(
-            ["init", "-input=false", "-backend=false"], directory, env={"TF_DATA_DIR": str(runtime / ".terraform")}
+            [
+                "init",
+                "-input=false",
+                "-reconfigure",
+                f"-backend-config=path={state_path}",
+            ],
+            directory,
+            env={"TF_DATA_DIR": str(runtime / ".terraform")},
         )
+        self._assert_source_state_unchanged(directory, snapshot)
         return {"status": "success", "output": result.stdout}
 
-    def plan(self, provider_id: str, location_id: str, options: DeploymentOptions | None = None) -> dict[str, object]:
-        return self._create_and_run(provider_id, location_id, options or DeploymentOptions(), apply=False)
+    def plan(
+        self,
+        provider_id: str,
+        location_id: str,
+        options: DeploymentOptions | None = None,
+        deployment_id: str | None = None,
+    ) -> dict[str, object]:
+        return self._create_and_run(
+            provider_id, location_id, options or DeploymentOptions(), apply=False, deployment_id=deployment_id
+        )
 
-    def deploy(self, provider_id: str, location_id: str, options: DeploymentOptions | None = None) -> dict[str, object]:
-        return self._create_and_run(provider_id, location_id, options or DeploymentOptions(), apply=True)
+    def deploy(
+        self,
+        provider_id: str,
+        location_id: str,
+        options: DeploymentOptions | None = None,
+        deployment_id: str | None = None,
+    ) -> dict[str, object]:
+        return self._create_and_run(
+            provider_id, location_id, options or DeploymentOptions(), apply=True, deployment_id=deployment_id
+        )
 
     def _create_and_run(
-        self, provider_id: str, location_id: str, options: DeploymentOptions, *, apply: bool
+        self,
+        provider_id: str,
+        location_id: str,
+        options: DeploymentOptions,
+        *,
+        apply: bool,
+        deployment_id: str | None,
     ) -> dict[str, object]:
         validate_options(options)
+        self._assert_provider_ready_for_new_deployment(provider_id)
         provider = self.providers.get(provider_id)
         location = self.catalog.get_location(provider_id, location_id)
         if not provider.info.terraform_root:
             raise ValueError("Residential node import is not implemented yet")
-        terraform_directory = (self.resource_root / provider.info.terraform_root).resolve()
-        if terraform_directory.parent != self.resource_root or not terraform_directory.is_dir():
-            raise TerraformError("Unsafe or missing Terraform working directory")
-        deployment_id = str(uuid.uuid4())
-        runtime = self.runtime_root / deployment_id
+        terraform_directory = self._provider_directory(provider_id)
+        identifier = deployment_id or self.new_deployment_id()
+        runtime = (self.runtime_root / identifier).resolve()
         runtime.mkdir(parents=True, exist_ok=False)
         state_path = runtime / "terraform.tfstate"
         expires = None
         if options.expiration_minutes:
             expires = (datetime.now(timezone.utc) + timedelta(minutes=options.expiration_minutes)).isoformat()
         record = DeploymentRecord(
-            deployment_id,
+            identifier,
             provider_id,
             location_id,
             str(terraform_directory),
@@ -95,136 +152,175 @@ class Orchestrator:
             expires_at=expires,
             auto_expire=options.automatic_expiration,
         )
+        self._assert_record_paths(record)
         self.deployments.save(record)
-        cancel = self._cancellations.setdefault(deployment_id, threading.Event())
+        cancel = threading.Event()
+        self._cancellations[identifier] = cancel
         try:
             self._transition(record, DeploymentState.VALIDATING_CREDENTIALS, "Checking provider credentials")
-            valid, message = provider.validate_credentials()
+            self._raise_if_cancelled(cancel)
+            valid, message = provider.validate_credentials(cancel)
+            self._raise_if_cancelled(cancel)
             legacy_tfvars = terraform_directory / "terraform.tfvars"
-            if not valid and not legacy_tfvars.is_file():
+            if not valid and (provider_id == "aws-lightsail" or not legacy_tfvars.is_file()):
                 raise ValueError(message)
             if not valid:
                 self._log(
-                    deployment_id,
-                    "Using legacy terraform.tfvars credentials; migrate to provider environment variables",
+                    identifier, "Using legacy terraform.tfvars credentials; migrate to provider environment variables"
                 )
+
             server_private, server_public = generate_wireguard_keypair()
             client_private, client_public = generate_wireguard_keypair()
-            variables = provider.terraform_variables(location, options)
-            variables.update(
-                {
-                    "server_private_key": server_private,
-                    "server_public_key": server_public,
-                    "client_public_key": client_public,
-                }
-            )
-            var_file = runtime / "deployment.auto.tfvars.json"
-            write_secret(var_file, json.dumps(variables))
-            client_key_file = runtime / "client.privatekey"
-            write_secret(client_key_file, client_private + "\n")
-            env = {"TF_DATA_DIR": str(runtime / ".terraform"), "TF_IN_AUTOMATION": "1"}
+            ssh_private, ssh_public = generate_ssh_keypair()
+            write_secret(runtime / "client.privatekey", client_private + "\n")
+            write_secret(runtime / "ssh.privatekey", ssh_private)
+            write_secret(runtime / "ssh.publickey", ssh_public + "\n")
+            self._raise_if_cancelled(cancel)
 
-            def progress(line: str) -> None:
-                self._log(deployment_id, line)
-
-            with self.runner.lock_for(terraform_directory):
-                self._transition(record, DeploymentState.INITIALIZING, "Initializing Terraform providers")
-                self.runner.run(
-                    ["init", "-input=false", "-backend=false"],
-                    terraform_directory,
+            env = self._terraform_env(record)
+            with self._provider_operation_lock(provider_id, terraform_directory):
+                self._transition(
+                    record, DeploymentState.INITIALIZING, "Initializing deployment-scoped Terraform backend"
+                )
+                self._run_terraform(
+                    record,
+                    [
+                        "init",
+                        "-input=false",
+                        "-reconfigure",
+                        f"-backend-config=path={state_path}",
+                    ],
                     env=env,
                     cancel=cancel,
-                    progress=progress,
                 )
-                self.runner.run(
-                    ["validate", "-no-color"], terraform_directory, env=env, cancel=cancel, progress=progress
+                self._run_terraform(record, ["validate", "-no-color"], env=env, cancel=cancel)
+                self._raise_if_cancelled(cancel)
+
+                manual_ssh_cidr = bool(options.ssh_cidr)
+                ssh_cidr = normalize_public_ipv4_cidr(options.ssh_cidr) if options.ssh_cidr else self.ip_detector()
+                effective_options = replace(options, ssh_cidr=ssh_cidr)
+                variables = provider.terraform_variables(location, effective_options)
+                variables.update(
+                    {
+                        "deployment_id": identifier,
+                        "expires_at": expires,
+                        "server_private_key": server_private,
+                        "server_public_key": server_public,
+                        "client_public_key": client_public,
+                        "ssh_public_key": ssh_public,
+                    }
                 )
+                var_file = runtime / "deployment.auto.tfvars.json"
+                write_secret(var_file, json.dumps(variables))
+
+                record.plan_started_at = now_iso()
+                self.deployments.save(record)
                 self._transition(record, DeploymentState.PLANNING, "Creating an explicit Terraform plan")
                 plan_path = runtime / "deployment.tfplan"
-                self.runner.run(
-                    [
-                        "plan",
-                        "-input=false",
-                        "-no-color",
-                        f"-state={state_path}",
-                        f"-var-file={var_file}",
-                        f"-out={plan_path}",
-                    ],
-                    terraform_directory,
+                self._run_terraform(
+                    record,
+                    ["plan", "-input=false", "-no-color", f"-var-file={var_file}", f"-out={plan_path}"],
                     env=env,
                     cancel=cancel,
-                    progress=progress,
                 )
+                record.plan_completed_at = now_iso()
+                self.deployments.save(record)
                 if not apply:
-                    return {"status": "success", "deployment_id": deployment_id, "state": record.state.value}
+                    return {"status": "success", "deployment_id": identifier, "state": record.state.value}
+
+                record.apply_started_at = now_iso()
+                record.resources_possible = True
+                record.cleanup_status = "required"
+                self.deployments.save(record)
                 self._transition(record, DeploymentState.PROVISIONING, "Applying the reviewed plan")
-                self.runner.run(
+                self._run_terraform(
+                    record,
                     ["apply", "-input=false", "-no-color", str(plan_path)],
-                    terraform_directory,
                     env=env,
                     cancel=cancel,
-                    progress=progress,
                 )
-                outputs = self.runner.output_json(
-                    terraform_directory, state_path, env=env, cancel=cancel, progress=progress
-                )
-            record.public_ip = str(output_value(outputs, "vpn_public_ip"))
-            resource_ids = outputs.get("resource_ids", {})
-            if isinstance(resource_ids, dict) and isinstance(resource_ids.get("value"), dict):
-                record.resource_ids = {str(k): str(v) for k, v in resource_ids["value"].items()}
+                record.apply_completed_at = now_iso()
+                record.state_present = state_path.is_file()
+                self.deployments.save(record)
+                if not record.state_present:
+                    raise TerraformError(f"Terraform apply completed without deployment state at {state_path}")
+                outputs = self._terraform_outputs(record, env=env, cancel=cancel)
+
+            contract = validate_provider_outputs(outputs, provider_id=provider_id, deployment_id=identifier)
+            record.public_ip = contract.vpn_public_ip
+            record.resource_ids = {str(key): str(value) for key, value in contract.resource_ids.items()}
             self.deployments.save(record)
             self._transition(
-                record, DeploymentState.WAITING_FOR_CLOUD_INIT, "Cloud-init applied; starting bounded health checks"
+                record, DeploymentState.WAITING_FOR_CLOUD_INIT, "Cloud resources exist; starting health checks"
             )
-            self._basic_health_checks(record, outputs, options, client_private)
+            self._basic_health_checks(
+                record,
+                contract,
+                effective_options,
+                client_private,
+                cancel,
+                automatic_ssh_cidr=not manual_ssh_cidr,
+            )
             self._transition(record, DeploymentState.READY, "WireGuard gateway is ready")
             return {
                 "status": "success",
-                "deployment_id": deployment_id,
+                "deployment_id": identifier,
                 "state": record.state.value,
                 "ip": record.public_ip,
-                "config": self.get_client_config(deployment_id),
+                "config": self.get_client_config(identifier),
                 "expires_at": record.expires_at,
             }
         except TerraformCancelled as exc:
+            record.state_present = Path(record.state_path).is_file()
+            record.cleanup_status = "required" if record.resources_possible else "not_required"
             self._transition(record, DeploymentState.CANCELLED, str(exc), error=str(exc))
-            return {"status": "error", "deployment_id": deployment_id, "state": record.state.value, "message": str(exc)}
+            return {"status": "error", "deployment_id": identifier, "state": record.state.value, "message": str(exc)}
         except Exception as exc:
+            record.state_present = Path(record.state_path).is_file()
+            record.cleanup_status = "required" if record.resources_possible else "not_required"
             message = redact(str(exc))
             self._transition(record, DeploymentState.FAILED, message, error=message)
-            return {"status": "error", "deployment_id": deployment_id, "state": record.state.value, "message": message}
+            return {"status": "error", "deployment_id": identifier, "state": record.state.value, "message": message}
 
     def _basic_health_checks(
-        self, record: DeploymentRecord, outputs: dict[str, object], options: DeploymentOptions, client_private: str
+        self,
+        record: DeploymentRecord,
+        outputs: ProviderOutputs,
+        options: DeploymentOptions,
+        client_private: str,
+        cancel: threading.Event,
+        *,
+        automatic_ssh_cidr: bool,
     ) -> None:
-        if not record.public_ip:
-            raise TerraformError("The provider did not allocate a public IP")
-        server_public = str(output_value(outputs, "server_public_key"))
-        config = self._render_client_config(record.public_ip, server_public, client_private, options)
+        self._raise_if_cancelled(cancel)
+        config = self._render_client_config(record.public_ip or "", outputs.server_public_key, client_private, options)
         self._validate_client_config(config)
         write_secret(Path(record.runtime_directory) / "client.conf", config)
-        ready = outputs.get("readiness_hint")
-        if not isinstance(ready, dict) or not ready.get("value"):
-            raise TerraformError("Terraform did not provide a cloud-init readiness hint")
-        self._transition(
-            record,
-            DeploymentState.CHECKING_WIREGUARD,
-            "Client configuration validated; checking the server over SSH",
-        )
-        self._ssh_health_checks(record, options)
+        self._transition(record, DeploymentState.CHECKING_WIREGUARD, "Checking cloud-init and WireGuard over SSH")
+        self._ssh_health_checks(record, options, cancel, automatic_ssh_cidr=automatic_ssh_cidr)
         if options.verify_egress:
+            self._raise_if_cancelled(cancel)
             self._transition(
                 record,
                 DeploymentState.VERIFYING_EGRESS,
                 "Egress verification requires a connected client and remains pending",
             )
 
-    def _ssh_health_checks(self, record: DeploymentRecord, options: DeploymentOptions) -> None:
-        """Bounded checks for cloud-init, WireGuard, forwarding, NAT, and UDP."""
+    def _ssh_health_checks(
+        self,
+        record: DeploymentRecord,
+        options: DeploymentOptions,
+        cancel: threading.Event,
+        *,
+        automatic_ssh_cidr: bool,
+    ) -> None:
         assert record.public_ip
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + self.readiness_timeout
         last_error = "SSH did not become ready"
         user = "ubuntu" if record.provider_id == "aws-lightsail" else "root"
+        runtime = Path(record.runtime_directory)
+        identity = runtime / "ssh.privatekey"
+        known_hosts = runtime / "known_hosts"
         remote_check = (
             "cloud-init status --wait >/dev/null && "
             "test -f /var/lib/cloud/instance/wireguard-ready && "
@@ -234,34 +330,77 @@ class Orchestrator:
             "iptables -t nat -C POSTROUTING -j MASQUERADE && "
             f"ss -H -lun 'sport = :{options.wireguard_port}' | grep -q ."
         )
+        attempts = 0
+        ip_refresh_attempted = False
         while time.monotonic() < deadline:
+            self._raise_if_cancelled(cancel)
+            attempts += 1
             try:
-                with socket.create_connection((record.public_ip, 22), timeout=5):
+                with socket.create_connection((record.public_ip, 22), timeout=3):
                     pass
-                result = subprocess.run(
-                    [
-                        "ssh",
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "ConnectTimeout=10",
-                        "-o",
-                        "StrictHostKeyChecking=accept-new",
-                        f"{user}@{record.public_ip}",
-                        remote_check,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=45,
-                    check=False,
-                )
-                if result.returncode == 0:
+                args = [
+                    "ssh",
+                    "-i",
+                    str(identity),
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "PasswordAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    f"UserKnownHostsFile={known_hosts}",
+                    f"{user}@{record.public_ip}",
+                    remote_check,
+                ]
+                returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=45)
+                if returncode == 0:
                     return
-                last_error = redact((result.stderr or result.stdout).strip())[-500:]
+                last_error = redact((stderr or stdout).strip())[-500:]
+            except TerraformCancelled:
+                raise
             except (OSError, subprocess.SubprocessError) as exc:
                 last_error = redact(str(exc))
-            time.sleep(5)
+
+            if automatic_ssh_cidr and not ip_refresh_attempted and attempts >= 3:
+                ip_refresh_attempted = True
+                try:
+                    detected = self.ip_detector()
+                    if detected != options.ssh_cidr:
+                        self._refresh_ssh_firewall(record, detected, cancel)
+                        options = replace(options, ssh_cidr=detected)
+                except (PublicIpDetectionError, TerraformError) as exc:
+                    last_error = redact(str(exc))
+            if cancel.wait(5):
+                raise TerraformCancelled("Deployment cancelled during server readiness checks")
         raise TerraformError(f"Server readiness checks timed out: {last_error}")
+
+    def _refresh_ssh_firewall(self, record: DeploymentRecord, cidr: str, cancel: threading.Event) -> None:
+        runtime = Path(record.runtime_directory)
+        var_file = runtime / "deployment.auto.tfvars.json"
+        variables = json.loads(var_file.read_text(encoding="utf-8"))
+        variables["ssh_allowed_cidr"] = cidr
+        write_secret(var_file, json.dumps(variables))
+        plan_path = runtime / "ssh-cidr-refresh.tfplan"
+        directory = Path(record.terraform_directory)
+        env = self._terraform_env(record)
+        with self._provider_operation_lock(record.provider_id, directory):
+            self._run_terraform(
+                record,
+                ["plan", "-input=false", "-no-color", f"-var-file={var_file}", f"-out={plan_path}"],
+                env=env,
+                cancel=cancel,
+            )
+            self._run_terraform(
+                record,
+                ["apply", "-input=false", "-no-color", str(plan_path)],
+                env=env,
+                cancel=cancel,
+            )
 
     @staticmethod
     def _render_client_config(
@@ -286,48 +425,84 @@ class Orchestrator:
 
     @staticmethod
     def _validate_client_config(config: str) -> None:
-        required = ("[Interface]", "PrivateKey = ", "[Peer]", "PublicKey = ", "Endpoint = ", "AllowedIPs = ")
-        if not all(value in config for value in required):
+        required = (
+            "[Interface]",
+            "PrivateKey = ",
+            "DNS = ",
+            "[Peer]",
+            "PublicKey = ",
+            "Endpoint = ",
+            "AllowedIPs = ",
+        )
+        if not all(value in config for value in required) or "DNS = \n" in config:
             raise ValueError("Generated WireGuard client configuration is malformed")
 
     def destroy(self, deployment_id: str, preserve_config: bool = False) -> dict[str, object]:
         record = self.deployments.get(deployment_id)
-        directory = Path(record.terraform_directory).resolve()
-        runtime = Path(record.runtime_directory).resolve()
-        if directory.parent != self.resource_root or not directory.is_dir() or runtime.parent != self.runtime_root:
-            raise TerraformError("Refusing destroy: deployment paths are missing or ambiguous")
+        self._assert_record_paths(record)
+        runtime = Path(record.runtime_directory)
         state_path = Path(record.state_path)
+        if not record.resources_possible and not self.state_contains_resources(record):
+            raise TerraformError(
+                "No cloud resources can be established for this deployment; remove local deployment instead"
+            )
         if not state_path.is_file():
-            raise TerraformError("Refusing destroy: recorded Terraform state is missing")
+            record.cleanup_status = "failed"
+            self.deployments.save(record)
+            raise TerraformError("Cannot destroy safely: deployment Terraform state is missing")
+        record.state_present = True
+        record.cleanup_status = "destroying"
         self._transition(record, DeploymentState.DESTROYING, "Destroying deployment resources")
-        cancel = self._cancellations.setdefault(deployment_id, threading.Event())
-        env = {"TF_DATA_DIR": str(runtime / ".terraform"), "TF_IN_AUTOMATION": "1"}
+        cancel = threading.Event()
+        self._cancellations[deployment_id] = cancel
+        env = self._terraform_env(record)
         var_file = runtime / "deployment.auto.tfvars.json"
         try:
-            with self.runner.lock_for(directory):
-                self.runner.run(
-                    [
-                        "destroy",
-                        "-auto-approve",
-                        "-input=false",
-                        "-no-color",
-                        f"-state={state_path}",
-                        f"-var-file={var_file}",
-                    ],
-                    directory,
+            directory = Path(record.terraform_directory)
+            with self._provider_operation_lock(record.provider_id, directory):
+                self._run_terraform(
+                    record,
+                    ["init", "-input=false", "-reconfigure", f"-backend-config=path={state_path}"],
                     env=env,
                     cancel=cancel,
-                    progress=lambda line: self._log(deployment_id, line),
                 )
-            if not preserve_config:
-                for name in ("client.conf", "client.privatekey"):
-                    (runtime / name).unlink(missing_ok=True)
-            self._transition(record, DeploymentState.DESTROYED, "Deployment destroyed")
+                self._run_terraform(
+                    record,
+                    ["destroy", "-auto-approve", "-input=false", "-no-color", f"-var-file={var_file}"],
+                    env=env,
+                    cancel=cancel,
+                )
+            record.resources_possible = False
+            record.state_present = False
+            record.cleanup_status = "destroyed"
+            record.destroyed_at = now_iso()
+            self._cleanup_after_destroy(record, preserve_config=preserve_config)
+            record.public_ip = None
+            record.resource_ids = {}
+            record.last_error = None
+            record.legacy_backup_path = None
+            self._transition(record, DeploymentState.DESTROYED, "Deployment destroyed and sensitive artifacts removed")
             return {"status": "success", "deployment_id": deployment_id}
         except Exception as exc:
+            record.state_present = state_path.is_file()
+            record.resources_possible = True
+            record.cleanup_status = "failed"
             message = redact(str(exc))
             self._transition(record, DeploymentState.FAILED, message, error=message)
             return {"status": "error", "deployment_id": deployment_id, "message": message}
+
+    def remove_local_deployment(self, deployment_id: str) -> dict[str, str]:
+        record = self.deployments.get(deployment_id)
+        self._assert_record_paths(record)
+        if record.apply_started_at or record.resources_possible or self.state_contains_resources(record):
+            raise TerraformError(
+                "Local removal is blocked because cloud resources may exist; reconcile or destroy first"
+            )
+        runtime = Path(record.runtime_directory)
+        shutil.rmtree(runtime)
+        self.deployments.remove(deployment_id)
+        self._cancellations.pop(deployment_id, None)
+        return {"status": "success", "deployment_id": deployment_id}
 
     def cancel(self, deployment_id: str) -> dict[str, str]:
         self.deployments.get(deployment_id)
@@ -344,12 +519,374 @@ class Orchestrator:
             raise RuntimeError("Client configuration is not ready")
         return path.read_text(encoding="utf-8")
 
+    def get_logs(self, deployment_id: str) -> list[str]:
+        record = self.deployments.get(deployment_id)
+        path = Path(record.runtime_directory) / "deployment.log"
+        if not path.is_file():
+            return []
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-250:]
+
     def recovery_candidates(self) -> list[dict[str, object]]:
         return [
             record.to_dict()
             for record in self.deployments.list()
             if record.state not in {DeploymentState.DESTROYED, DeploymentState.IDLE}
         ]
+
+    def reconcile_interrupted(self) -> None:
+        pre_apply = {
+            DeploymentState.VALIDATING_CREDENTIALS,
+            DeploymentState.INITIALIZING,
+            DeploymentState.PLANNING,
+        }
+        post_apply = {
+            DeploymentState.PROVISIONING,
+            DeploymentState.WAITING_FOR_CLOUD_INIT,
+            DeploymentState.CHECKING_WIREGUARD,
+            DeploymentState.VERIFYING_EGRESS,
+            DeploymentState.DESTROYING,
+        }
+        for record in self.deployments.list():
+            state_file = Path(record.state_path)
+            record.state_present = state_file.is_file()
+            state_resources = self._state_resource_count(state_file)
+            if state_resources > 0:
+                record.resources_possible = True
+                record.cleanup_status = "required"
+            if record.state in pre_apply and not record.apply_started_at and state_resources == 0:
+                record.cleanup_status = "not_required"
+                self._transition(record, DeploymentState.CANCELLED, "Previous local operation was interrupted")
+            elif record.state in post_apply or state_resources > 0:
+                record.resources_possible = True
+                record.cleanup_status = "required"
+                self._transition(
+                    record,
+                    DeploymentState.FAILED,
+                    "Previous operation was interrupted after apply may have started; cloud cleanup may be required",
+                    error="Interrupted operation requires reconciliation",
+                )
+            else:
+                self.deployments.save(record)
+
+    def list_legacy_states(self) -> list[dict[str, object]]:
+        return [self._inspect_legacy_provider(provider_id) for provider_id in PROVIDER_RESOURCE_PREFIXES]
+
+    def migrate_legacy_state(self, provider_id: str) -> dict[str, object]:
+        report = self._inspect_legacy_provider(provider_id)
+        if report["classification"] != "active" or not report["migration_available"]:
+            raise TerraformError("Legacy state identity is not sufficiently certain for automatic migration")
+        source = Path(str(report["primary_path"]))
+        fingerprint = str(report["primary_sha256"])
+        candidates = self._legacy_identity_candidates(provider_id, source)
+        if len(candidates) != 1:
+            raise TerraformError("Legacy state does not match exactly one deployment registry record")
+        record = candidates[0]
+        self._assert_record_paths(record)
+        destination = Path(record.state_path)
+        if destination.exists():
+            raise TerraformError("Migration refused because the deployment already has runtime state")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = Path(record.runtime_directory) / f"legacy-state-backup-{timestamp}.tfstate"
+        shutil.copy2(source, backup)
+        shutil.copy2(source, destination)
+        if self._sha256(source) != fingerprint or self._sha256(destination) != fingerprint:
+            destination.unlink(missing_ok=True)
+            raise TerraformError("Legacy state changed during migration; the original was preserved")
+        record.state_present = True
+        record.resources_possible = True
+        record.cleanup_status = "required"
+        record.legacy_source_path = str(source)
+        record.legacy_source_sha256 = fingerprint
+        record.legacy_backup_path = str(backup)
+        self.deployments.save(record)
+        return {"status": "success", "deployment_id": record.id, "source_preserved": True}
+
+    def _inspect_legacy_provider(self, provider_id: str) -> dict[str, object]:
+        directory = self._provider_directory(provider_id)
+        primary = directory / "terraform.tfstate"
+        backup = directory / "terraform.tfstate.backup"
+        primary_info = self._inspect_state_file(primary)
+        backup_info = self._inspect_state_file(backup)
+        classification = "none"
+        reason = "No provider-root state files detected"
+        migration_available = False
+        blocking = False
+        if primary_info["exists"] and not primary_info["parseable"]:
+            classification, reason, blocking = "malformed", "Primary provider-root state is malformed", True
+        elif backup_info["exists"] and not backup_info["parseable"]:
+            classification, reason, blocking = "malformed", "Provider-root state backup is malformed", True
+        elif isinstance(primary_info["resources"], int) and primary_info["resources"] > 0:
+            classification, reason, blocking = "active", "Primary provider-root state contains managed resources", True
+            migration_available = bool(
+                primary_info["identity_valid"] and self._legacy_identity_candidates(provider_id, primary)
+            )
+        elif isinstance(backup_info["resources"], int) and backup_info["resources"] > 0:
+            classification = "ambiguous"
+            reason = "Primary state is empty or missing while its backup contains managed resources"
+            blocking = True
+        elif primary_info["exists"] or backup_info["exists"]:
+            classification, reason = "empty", "Provider-root state files contain no managed resources"
+        fingerprint = primary_info.get("sha256")
+        if fingerprint and any(
+            record.legacy_source_sha256 == fingerprint and record.provider_id == provider_id
+            for record in self.deployments.list()
+        ):
+            classification, reason, blocking = (
+                "migrated",
+                "Legacy state was copied to its matched runtime deployment",
+                False,
+            )
+            migration_available = False
+        return {
+            "provider_id": provider_id,
+            "classification": classification,
+            "reason": reason,
+            "blocking": blocking,
+            "migration_available": migration_available,
+            "primary_path": str(primary),
+            "primary_sha256": primary_info.get("sha256"),
+            "primary_resources": primary_info["resources"],
+            "backup_path": str(backup),
+            "backup_resources": backup_info["resources"],
+        }
+
+    def _inspect_state_file(self, path: Path) -> dict[str, object]:
+        if not path.is_file():
+            return {"exists": False, "parseable": False, "resources": 0, "identity_valid": False}
+        result: dict[str, object] = {
+            "exists": True,
+            "parseable": False,
+            "resources": 0,
+            "identity_valid": False,
+            "sha256": self._sha256(path),
+        }
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            resources = [
+                item
+                for item in state.get("resources", [])
+                if isinstance(item, dict) and isinstance(item.get("instances"), list) and item["instances"]
+            ]
+            result["parseable"] = True
+            result["resources"] = len(resources)
+            resource_ids = state.get("outputs", {}).get("resource_ids", {}).get("value")
+            result["identity_valid"] = bool(isinstance(resource_ids, dict) and resource_ids)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            pass
+        return result
+
+    def _legacy_identity_candidates(self, provider_id: str, state_path: Path) -> list[DeploymentRecord]:
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            resources = state.get("resources", [])
+            prefix = PROVIDER_RESOURCE_PREFIXES[provider_id]
+            if not resources or any(not str(item.get("type", "")).startswith(prefix) for item in resources):
+                return []
+            server_public = state.get("outputs", {}).get("server_public_key", {}).get("value")
+            if not isinstance(server_public, str) or not server_public:
+                return []
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return []
+        matches: list[DeploymentRecord] = []
+        for record in self.deployments.list():
+            if record.provider_id != provider_id or Path(record.state_path).exists():
+                continue
+            var_file = Path(record.runtime_directory) / "deployment.auto.tfvars.json"
+            try:
+                values = json.loads(var_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if values.get("server_public_key") == server_public:
+                matches.append(record)
+        return matches
+
+    def _assert_provider_ready_for_new_deployment(self, provider_id: str) -> None:
+        report = self._inspect_legacy_provider(provider_id)
+        if report["blocking"]:
+            raise TerraformError(
+                f"New {provider_id} deployment blocked by {report['classification']} legacy state: {report['reason']}"
+            )
+        active = [
+            record
+            for record in self.deployments.list()
+            if record.provider_id == provider_id
+            and record.state != DeploymentState.DESTROYED
+            and (record.resources_possible or record.apply_started_at or self.state_contains_resources(record))
+        ]
+        if active:
+            raise TerraformError(
+                f"New {provider_id} deployment blocked until existing cloud-capable deployment is reconciled"
+            )
+
+    def _provider_directory(self, provider_id: str) -> Path:
+        provider = self.providers.get(provider_id)
+        if not provider.info.terraform_root:
+            raise TerraformError(f"Provider {provider_id} has no Terraform root")
+        directory = (self.resource_root / provider.info.terraform_root).resolve()
+        if directory.parent != self.resource_root or not directory.is_dir():
+            raise TerraformError("Provider Terraform directory is missing or outside application resources")
+        return directory
+
+    def _assert_record_paths(self, record: DeploymentRecord) -> None:
+        directory = Path(record.terraform_directory).resolve()
+        runtime = Path(record.runtime_directory).resolve()
+        state = Path(record.state_path).resolve()
+        if directory != self._provider_directory(record.provider_id):
+            raise TerraformError("Recorded Terraform source directory is unsafe or inconsistent")
+        self._assert_scoped_path(runtime, state)
+
+    def _assert_scoped_path(self, runtime: Path, state: Path) -> None:
+        if runtime.parent != self.runtime_root or state.parent != runtime or state.name != "terraform.tfstate":
+            raise TerraformError("Terraform state must be the deployment runtime terraform.tfstate")
+        if runtime == self.runtime_root or self.resource_root in (runtime, *runtime.parents):
+            raise TerraformError("Deployment runtime must not be inside application resources")
+
+    def _terraform_env(self, record: DeploymentRecord) -> dict[str, str]:
+        runtime = Path(record.runtime_directory)
+        return {"TF_DATA_DIR": str(runtime / ".terraform"), "TF_IN_AUTOMATION": "1"}
+
+    def _run_terraform(
+        self,
+        record: DeploymentRecord,
+        args: list[str],
+        *,
+        env: dict[str, str],
+        cancel: threading.Event,
+    ) -> None:
+        self._assert_record_paths(record)
+        directory = Path(record.terraform_directory)
+        snapshot = self._source_state_snapshot(directory)
+        try:
+            self.runner.run(
+                args,
+                directory,
+                env=env,
+                cancel=cancel,
+                progress=lambda line: self._log(record.id, line),
+            )
+        finally:
+            self._assert_source_state_unchanged(directory, snapshot)
+
+    def _terraform_outputs(
+        self, record: DeploymentRecord, *, env: dict[str, str], cancel: threading.Event
+    ) -> dict[str, object]:
+        self._assert_record_paths(record)
+        directory = Path(record.terraform_directory)
+        snapshot = self._source_state_snapshot(directory)
+        try:
+            return self.runner.output_json(
+                directory,
+                env=env,
+                cancel=cancel,
+                progress=lambda line: self._log(record.id, line),
+            )
+        finally:
+            self._assert_source_state_unchanged(directory, snapshot)
+
+    def _provider_operation_lock(self, provider_id: str, directory: Path) -> ContextManager[None]:
+        thread_lock = self.runner.lock_for(directory)
+        file_lock = FileLock(self.runtime_root / "locks" / f"{provider_id}.lock", timeout=60)
+
+        class CombinedLock:
+            def __enter__(self_nonlocal) -> None:
+                thread_lock.acquire()
+                try:
+                    file_lock.__enter__()
+                except Exception:
+                    thread_lock.release()
+                    raise
+
+            def __exit__(self_nonlocal, exc_type: object, exc: object, traceback: object) -> None:
+                try:
+                    file_lock.__exit__(exc_type, exc, traceback)  # type: ignore[arg-type]
+                finally:
+                    thread_lock.release()
+
+        return CombinedLock()
+
+    def _source_state_snapshot(self, directory: Path) -> dict[str, str | None]:
+        return {
+            name: self._sha256(directory / name) if (directory / name).is_file() else None
+            for name in LEGACY_STATE_NAMES
+        }
+
+    def _assert_source_state_unchanged(self, directory: Path, before: dict[str, str | None]) -> None:
+        after = self._source_state_snapshot(directory)
+        if before != after:
+            raise TerraformError(f"Safety invariant failed: Terraform modified provider-root state in {directory}")
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def state_contains_resources(self, record: DeploymentRecord) -> bool:
+        return self._state_resource_count(Path(record.state_path)) > 0
+
+    @staticmethod
+    def _state_resource_count(path: Path) -> int:
+        if not path.is_file():
+            return 0
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            return sum(
+                1
+                for item in state.get("resources", [])
+                if isinstance(item, dict) and isinstance(item.get("instances"), list) and item["instances"]
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            return 0
+
+    @staticmethod
+    def _raise_if_cancelled(cancel: threading.Event) -> None:
+        if cancel.is_set():
+            raise TerraformCancelled("Deployment operation cancelled")
+
+    @staticmethod
+    def _run_cancellable_process(args: list[str], cancel: threading.Event, *, timeout: float) -> tuple[int, str, str]:
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            if cancel.wait(0.1):
+                process.terminate()
+                try:
+                    process.wait(3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                raise TerraformCancelled("Deployment cancelled during SSH readiness checks")
+            if time.monotonic() >= deadline:
+                process.kill()
+                raise subprocess.TimeoutExpired(args, timeout)
+        stdout, stderr = process.communicate()
+        return process.returncode, stdout, stderr
+
+    def _cleanup_after_destroy(self, record: DeploymentRecord, *, preserve_config: bool) -> None:
+        runtime = Path(record.runtime_directory)
+        sensitive = [
+            "deployment.auto.tfvars.json",
+            "deployment.tfplan",
+            "ssh-cidr-refresh.tfplan",
+            "terraform.tfstate",
+            "terraform.tfstate.backup",
+            "client.privatekey",
+            "ssh.privatekey",
+            "ssh.publickey",
+            "known_hosts",
+        ]
+        if not preserve_config:
+            sensitive.append("client.conf")
+        for name in sensitive:
+            (runtime / name).unlink(missing_ok=True)
+        for pattern in ("*.tfstate", "*.tfstate.backup", "*.tfplan", "*.privatekey"):
+            for path in runtime.glob(pattern):
+                if path.is_file():
+                    path.unlink()
+        terraform_data = runtime / ".terraform"
+        if terraform_data.is_dir():
+            shutil.rmtree(terraform_data)
 
     def _transition(
         self, record: DeploymentRecord, state: DeploymentState, message: str, error: str | None = None
@@ -359,9 +896,15 @@ class Orchestrator:
         self.deployments.save(record)
         event = StatusEvent(record.id, state, message)
         self._events.append(event)
+        self._log(record.id, message)
         if self.on_event:
             self.on_event(event)
 
     def _log(self, deployment_id: str, line: str) -> None:
+        try:
+            record = self.deployments.get(deployment_id)
+            append_redacted_log(Path(record.runtime_directory) / "deployment.log", line)
+        except (KeyError, OSError, RuntimeError):
+            pass
         if self.on_log:
             self.on_log(deployment_id, redact(line))

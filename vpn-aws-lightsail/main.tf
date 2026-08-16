@@ -1,19 +1,25 @@
 locals {
-  vpn_name = "ephemeral-vpn-lightsail"
+  vpn_name = "ephemeral-vpn-lightsail-${substr(var.deployment_id, 0, 8)}"
   cloud_init = templatefile("${path.module}/../terraform-common/cloud-init.yaml.tftpl", {
     wireguard_port     = var.wireguard_port
     server_private_key = var.server_private_key
     client_public_key  = var.client_public_key
   })
 }
+resource "aws_lightsail_key_pair" "vpn" {
+  count      = var.ssh_public_key == null ? 0 : 1
+  name       = "${local.vpn_name}-ssh"
+  public_key = var.ssh_public_key
+  tags       = { Purpose = "ephemeral-wireguard", Deployment = var.deployment_id, ExpiresAt = coalesce(var.expires_at, "disabled") }
+}
 resource "aws_lightsail_instance" "vpn" {
   name              = local.vpn_name
   availability_zone = "${var.region}${var.availability_zone_suffix}"
   blueprint_id      = "ubuntu_24_04"
   bundle_id         = var.instance_type
-  key_pair_name     = var.ssh_key_pair_name
+  key_pair_name     = var.ssh_public_key == null ? var.ssh_key_pair_name : aws_lightsail_key_pair.vpn[0].name
   user_data         = local.cloud_init
-  tags              = { Purpose = "ephemeral-wireguard" }
+  tags              = { Purpose = "ephemeral-wireguard", Deployment = var.deployment_id, ExpiresAt = coalesce(var.expires_at, "disabled") }
 }
 resource "aws_lightsail_static_ip" "vpn" {
   name = "${local.vpn_name}-ip"
@@ -47,7 +53,11 @@ output "server_public_key" {
 }
 output "resource_ids" {
   description = "Non-secret resource identifiers"
-  value       = { instance_name = aws_lightsail_instance.vpn.name, static_ip_name = aws_lightsail_static_ip.vpn.name }
+  value = {
+    instance_name  = aws_lightsail_instance.vpn.name
+    static_ip_name = aws_lightsail_static_ip.vpn.name
+    ssh_key_name   = var.ssh_public_key == null ? coalesce(var.ssh_key_pair_name, "provider-default") : aws_lightsail_key_pair.vpn[0].name
+  }
 }
 output "readiness_hint" {
   description = "Remote readiness marker created by cloud-init"

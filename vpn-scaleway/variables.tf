@@ -60,3 +60,20 @@ variable "client_public_key" {
   description = "WireGuard client public key"
   type        = string
 }
+variable "deployment_id" {
+  description = "Application deployment UUID used for ownership and unique names"
+  type        = string
+  default     = "manual"
+}
+variable "expires_at" {
+  description = "Best-effort local expiration timestamp; no cloud-side reaper is implied"
+  type        = string
+  default     = null
+  nullable    = true
+}
+variable "ssh_public_key" {
+  description = "Per-deployment OpenSSH public key registered by the application"
+  type        = string
+  default     = null
+  nullable    = true
+}

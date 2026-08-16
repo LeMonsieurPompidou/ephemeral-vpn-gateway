@@ -107,8 +107,8 @@ class TerraformRunner:
             raise TerraformError(f"Terraform exited with code {result.returncode}: {detail}")
         return result
 
-    def output_json(self, cwd: Path, state_path: Path, **kwargs: object) -> dict[str, object]:
-        result = self.run(["output", "-json", f"-state={state_path}"], cwd, **kwargs)  # type: ignore[arg-type]
+    def output_json(self, cwd: Path, **kwargs: object) -> dict[str, object]:
+        result = self.run(["output", "-json"], cwd, **kwargs)  # type: ignore[arg-type]
         try:
             value = json.loads(result.stdout or "{}")
         except json.JSONDecodeError as exc:

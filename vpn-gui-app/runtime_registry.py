@@ -5,6 +5,7 @@ import os
 import threading
 from pathlib import Path
 
+from file_lock import FileLock
 from models import DeploymentRecord, DeploymentState, now_iso
 
 
@@ -18,22 +19,34 @@ class DeploymentRegistry:
 
     def list(self) -> list[DeploymentRecord]:
         with self._lock:
-            values = self._read().values()
+            with FileLock(self.path.with_suffix(".lock")):
+                values = list(self._read().values())
             return sorted((DeploymentRecord.from_dict(item) for item in values), key=lambda item: item.created_at)
 
     def get(self, deployment_id: str) -> DeploymentRecord:
         with self._lock:
-            try:
-                return DeploymentRecord.from_dict(self._read()[deployment_id])
-            except KeyError as exc:
-                raise KeyError(f"Unknown deployment: {deployment_id}") from exc
+            with FileLock(self.path.with_suffix(".lock")):
+                try:
+                    return DeploymentRecord.from_dict(self._read()[deployment_id])
+                except KeyError as exc:
+                    raise KeyError(f"Unknown deployment: {deployment_id}") from exc
 
     def save(self, record: DeploymentRecord) -> None:
         with self._lock:
-            records = self._read()
-            record.updated_at = now_iso()
-            records[record.id] = record.to_dict()
-            self._write(records)
+            with FileLock(self.path.with_suffix(".lock")):
+                records = self._read()
+                record.updated_at = now_iso()
+                records[record.id] = record.to_dict()
+                self._write(records)
+
+    def remove(self, deployment_id: str) -> None:
+        with self._lock:
+            with FileLock(self.path.with_suffix(".lock")):
+                records = self._read()
+                if deployment_id not in records:
+                    raise KeyError(f"Unknown deployment: {deployment_id}")
+                del records[deployment_id]
+                self._write(records)
 
     def transition(self, deployment_id: str, state: DeploymentState, *, error: str | None = None) -> DeploymentRecord:
         record = self.get(deployment_id)

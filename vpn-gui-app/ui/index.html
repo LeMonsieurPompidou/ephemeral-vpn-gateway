@@ -14,23 +14,23 @@
       <label>Provider<select id="provider"></select></label>
       <label>Country<select id="country"></select></label>
       <label>City / region<select id="location"></select></label>
+      <label>Lifetime<select id="expiration"><option value="">Disabled</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="240">4 hours</option><option value="480">8 hours</option></select></label>
     </div>
     <div class="badges"><span id="server-type" class="badge">cloud</span><span id="streaming" class="badge muted">unverified</span><span id="cost" class="badge muted">Cost unavailable</span></div>
+    <p class="muted-text">Lifetime cleanup is local and best-effort. It cannot run while this computer is off, the app is closed, or cloud credentials are unavailable.</p>
   </section>
-  <details class="section"><summary>Network and lifetime options</summary>
+  <details class="section"><summary>Advanced settings</summary>
     <div class="form-grid options">
       <label>Traffic mode<select id="traffic-mode"><option value="ipv4">IPv4 full tunnel</option><option value="custom">Custom AllowedIPs</option></select></label>
       <label>Custom AllowedIPs<input id="allowed-ips" value="0.0.0.0/0" disabled></label>
       <label>DNS servers<input id="dns" value="1.1.1.1, 1.0.0.1"></label>
       <label>WireGuard port<input id="port" type="number" value="51820" min="1" max="65535"></label>
-      <label>Client MTU<input id="mtu" type="number" value="1420" min="576" max="9000"></label>
-      <label>Keepalive (seconds)<input id="keepalive" type="number" value="25" min="0"></label>
-      <label>SSH source CIDR<input id="ssh-cidr" value="127.0.0.1/32"></label>
-      <label>Automatic expiration<select id="expiration"><option value="">Disabled</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="240">4 hours</option><option value="480">8 hours</option></select></label>
+      <label>Manual SSH source /32 (optional)<input id="ssh-cidr" value="" placeholder="Automatically detected"></label>
     </div>
   </details>
+  <section id="legacy-recovery" class="section hidden"><h2 class="section-title">Legacy Terraform state requires attention</h2><p>Provider-root state is preserved and can block new deployments until it is reconciled.</p><div id="legacy-list"></div></section>
   <section id="recovery" class="section hidden"><h2 class="section-title">Recovery</h2><p>These deployments may still own billable resources.</p><div id="recovery-list"></div></section>
-  <section class="section actions"><button id="deploy" class="btn btn-primary">Deploy VPN</button><button id="cancel" class="btn" disabled>Cancel</button><button id="destroy" class="btn btn-destructive" disabled>Destroy VPN</button></section>
+  <section class="section actions"><button id="deploy" class="btn btn-primary">Deploy VPN</button><button id="validate-credentials" class="btn">Check credentials</button><button id="cancel" class="btn" disabled>Cancel local operation</button><button id="remove-local" class="btn" disabled>Remove local deployment</button><button id="destroy" class="btn btn-destructive" disabled>Destroy cloud resources</button></section>
   <section id="status-card" class="status-card">
     <div class="status-header"><div id="status-dot" class="status-indicator"></div><div><strong id="status-text">Idle</strong><div id="elapsed" class="muted-text">00:00</div></div></div>
     <ol id="steps" class="steps"></ol>

@@ -1,169 +1,160 @@
 # Ephemeral VPN Gateway
 
-Ephemeral VPN Gateway provisions short-lived WireGuard gateways with Terraform and a
-Python/pywebview desktop interface. Supported cloud adapters are DigitalOcean,
-Scaleway, and AWS Lightsail. A separate, non-provisioning residential adapter reserves
-a future interface for trusted user-owned nodes; it does not integrate proxy services.
+Ephemeral VPN Gateway provisions short-lived WireGuard gateways through Terraform and a Python/pywebview desktop UI. Terraform adapters are included for DigitalOcean, Scaleway, and AWS Lightsail. Cloud IP addresses are datacenter addresses; selecting a country does not guarantee access to a particular streaming service.
 
-Cloud IP addresses are datacenter addresses. A selected country does **not** guarantee
-access to any streaming catalog or service. Locations remain `unverified` unless a
-test result is explicitly recorded in the version-controlled catalog.
+## Normal workflow
 
-## Architecture
+The primary UI is deliberately small:
 
 ```text
-UI (HTML/CSS/JS; catalog-driven)
-  -> BridgeService (threaded operations, compatibility API)
-  -> Orchestrator (typed lifecycle, validation, health, recovery)
-  -> ProviderRegistry -> provider adapters
-  -> TerraformRunner -> provider root + deployment-scoped state
-
-vpn-gui-app/provider_catalog.json       provider/location metadata
-terraform-common/cloud-init.yaml.tftpl shared WireGuard provisioning
-vpn-{digitalocean,scaleway,aws-lightsail}/ provider resources
-runtime deployment registry            local, uncommitted, sensitive
+Provider -> Country -> Location -> Lifetime -> Deploy -> Connect
 ```
 
-The public orchestration concepts are `list_providers`, `list_locations`,
-`validate_credentials`, `initialize`, `plan`, `deploy`, `destroy`, `get_status`, and
-`get_client_config`. Provider selection uses a registry rather than conditional chains.
-Legacy `deploy(provider, region)` and unambiguous provider-based destroy calls remain
-available through the bridge as a migration path.
+Routing mode, custom `AllowedIPs`, DNS, WireGuard port, and an optional manual SSH source `/32` are under **Advanced settings**. MTU 1420 and persistent keepalive 25 are automatic tested defaults. Full-tunnel mode always produces `0.0.0.0/0`.
 
-## Locations and credentials
+`Lifetime` is local, best-effort cleanup. It is persisted and retried after the application restarts, but it cannot destroy resources while the computer is off, the application is not running, or provider credentials are unavailable. There is currently no provider-side TTL service.
 
-Locations are listed in [provider_catalog.json](vpn-gui-app/provider_catalog.json),
-including the initially supported Lightsail regions. Credentials use each provider's
-normal environment/shared-file resolution:
+## Architecture and runtime state
 
-- DigitalOcean: `DIGITALOCEAN_TOKEN` and `DIGITALOCEAN_SSH_KEY_NAME` (or the SSH key
-  name in an ignored legacy `terraform.tfvars`).
-- Scaleway: `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, and `SCW_DEFAULT_PROJECT_ID`.
-- AWS: the normal AWS SDK chain, including environment variables, `AWS_PROFILE`, shared
-  credential/config files, web identity, and instance credentials.
+```text
+UI -> BridgeService -> Orchestrator -> ProviderRegistry -> TerraformRunner
+```
 
-Existing DigitalOcean/Scaleway `terraform.tfvars` credential names remain accepted for
-migration, but environment variables are preferred. Copy the matching
-`terraform.tfvars.example` for non-secret CLI settings. Never commit the populated file.
-Set `ssh_allowed_cidr` to your public `/32`. The safe loopback default intentionally
-blocks remote SSH until it is configured.
+Every operation is bound to one deployment UUID. The default Windows runtime root is `%LOCALAPPDATA%\EphemeralVpnGateway`; set `EPHEMERAL_VPN_RUNTIME_DIR` to override it.
 
-## Development and build
+```text
+EphemeralVpnGateway\
+|-- deployments.json
+|-- deployments.lock
+|-- locks\<provider>.lock
+`-- <deployment-id>\
+    |-- .terraform\
+    |-- terraform.tfstate
+    |-- terraform.tfstate.backup       (when Terraform creates one)
+    |-- deployment.tfplan
+    |-- deployment.auto.tfvars.json
+    |-- client.privatekey
+    |-- client.conf                    (after apply)
+    |-- ssh.privatekey
+    |-- ssh.publickey
+    |-- known_hosts
+    `-- deployment.log
+```
 
-Requirements: Python 3.10+, Terraform 1.5+, OpenSSH, an existing provider SSH key, and
-the WireGuard client.
+Each Terraform root declares the local backend. Deployment `init` configures that backend with the absolute runtime `terraform.tfstate` path and sets a deployment-specific `TF_DATA_DIR`. Plan, saved-plan apply, output, and destroy therefore use one backend. Runtime guards reject unsafe paths and fingerprint provider-root state before and after every Terraform operation.
+
+Provider operations also use an OS/filesystem lock. Registry replacement is atomic and registry reads/writes use a cross-process lock.
+
+## Legacy provider-root state recovery
+
+Older versions could write ignored `terraform.tfstate` files into `vpn-aws-lightsail`, `vpn-digitalocean`, or `vpn-scaleway`. Startup inspects primary and backup files without changing them and classifies them as empty, active, malformed, ambiguous, or migrated.
+
+- Active, malformed, and ambiguous state blocks a new deployment for that provider.
+- The original state is never deleted, overwritten, moved, merged, or destroyed automatically.
+- Automatic migration is offered only when the primary state's provider resources and server public key match exactly one existing deployment registry record.
+- Migration creates a timestamped runtime backup, copies the state into that matched deployment's runtime, verifies hashes, and records the source and backup in registry metadata.
+- Empty or ambiguous backups require explicit operator reconciliation; the application does not guess which snapshot represents cloud reality.
+
+## Credentials
+
+### AWS IAM Identity Center / SSO
+
+Configure and log in with AWS CLI v2, then launch the GUI from the same environment:
+
+```powershell
+aws configure sso --profile heres-vpn
+aws sso login --profile heres-vpn
+$env:AWS_PROFILE = "heres-vpn"
+.\.venv\Scripts\python.exe vpn-gui-app\app.py
+```
+
+Before planning, the application locates AWS CLI v2 and runs a bounded, non-interactive:
+
+```text
+aws sts get-caller-identity --profile heres-vpn --no-cli-pager
+```
+
+Account details are not logged. An expired session produces an instruction to rerun `aws sso login --profile heres-vpn`. The UI's **Check credentials** action can be retried without restarting.
+
+### Other providers
+
+- DigitalOcean: `DIGITALOCEAN_TOKEN`
+- Scaleway: `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, and `SCW_DEFAULT_PROJECT_ID`
+
+Ignored legacy `terraform.tfvars` credentials remain accepted for migration compatibility, although environment variables are preferred.
+
+## SSH readiness and source address
+
+Immediately before planning, the application requests its public IPv4 from `https://checkip.amazonaws.com/`, validates that it is globally routable, and uses the exact `/32` in the provider firewall. Detection has a short timeout, never falls back to `0.0.0.0/0`, and does not log the address. A manual public IPv4 `/32` override is available under Advanced settings.
+
+If SSH readiness fails and automatic redetection returns a different address, the application performs one controlled Terraform plan/apply to update the SSH rule, then retries. It does not loop indefinitely.
+
+Each deployment also receives a locally generated Ed25519 SSH key:
+
+- AWS imports its public key as a Lightsail key pair and connects as `ubuntu`.
+- DigitalOcean registers its public key as a deployment SSH-key resource and connects as `root`.
+- Scaleway registers its public key as a deployment account SSH-key resource and connects as `root`.
+
+The SSH command always specifies the runtime private key with `-i`, uses `IdentitiesOnly=yes`, disables password/keyboard-interactive authentication, and keeps a deployment-local `known_hosts`. The private key is never passed to Terraform.
+
+Readiness checks wait for cloud-init and verify the marker, `wg-quick@wg0`, the `wg0` link, forwarding, NAT, and the configured UDP listener. Cancellation interrupts Terraform and SSH retry waits.
+
+## Lifecycle, cancellation, and recovery
+
+Durable registry metadata records plan/apply timestamps, state presence, whether cloud resources may exist, cleanup status, expiry, and legacy migration provenance.
+
+- Before apply starts, cancellation means cloud resources cannot have been created. The UI offers **Remove local deployment**, which removes the runtime and registry record.
+- From immediately before apply onward, the application conservatively assumes resources may exist. State and recovery material are retained and the UI offers **Destroy cloud resources**.
+- Destroy always receives a new cancellation token; it never reuses a cancelled deployment token.
+- Operations are mapped directly to their deployment IDs, so polling, cancellation, logs, and cleanup cannot select the newest unrelated record.
+- On restart, interrupted pre-apply records become locally removable. Interrupted apply/readiness/destroy records are marked as requiring reconciliation.
+
+Do not delete state for a partial apply. If state is missing after apply may have started, use the provider console and recovery metadata to reconcile resources before removing local records.
+
+## Keys, logs, and sensitive cleanup
+
+WireGuard server and client keypairs are generated locally with Python `cryptography` X25519. Users do not run `wg genkey`. Terraform receives the server private/public keys and client public key; it never receives the client private key.
+
+Saved plans, tfvars, and state are sensitive because they contain server provisioning material. Runtime files use restrictive modes where supported and inherit the user's protected application-data ACL on Windows.
+
+Per-deployment logs are redacted, ANSI-stripped, capped at 512 KiB, and never intentionally contain private keys, generated client configuration, API tokens, or temporary AWS credentials.
+
+After Terraform confirms successful destruction, the application removes:
+
+- generated tfvars and plans
+- Terraform state and backups
+- `.terraform`
+- WireGuard client secrets/configuration (unless explicitly preserved through the compatibility API)
+- the temporary SSH keypair and deployment `known_hosts`
+
+Only sanitized tombstone metadata and the bounded redacted log remain. Failed destruction preserves all recovery-required material.
+
+## Development and validation
+
+Requirements are Python 3.10+, Terraform 1.5+, OpenSSH, AWS CLI v2 for Lightsail, and a WireGuard client.
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python -m pip install -r vpn-gui-app\requirements.txt -r requirements-dev.txt
-.\.venv\Scripts\python vpn-gui-app\app.py
+.\.venv\Scripts\python.exe -m pip install -r vpn-gui-app\requirements.txt -r requirements-dev.txt
+.\.venv\Scripts\python.exe vpn-gui-app\app.py
 ```
 
-Build the packaged app from the repository root:
+Build from the repository root:
 
 ```powershell
 .\.venv\Scripts\pyinstaller "Hérès_VPN.spec"
 ```
 
-The spec includes the UI, catalog, shared template, and all Terraform roots and handles
-PyInstaller's resource directory explicitly.
-
-## Deployment lifecycle
-
-The state machine is: `idle`, `validating_credentials`, `initializing`, `planning`,
-`provisioning`, `waiting_for_cloud_init`, `checking_wireguard`, `verifying_egress`,
-`ready`, `destroying`, `destroyed`, `failed`, or `cancelled`. Terraform runs off the UI
-thread, streams redacted logs, uses argument arrays, validates configuration, creates an
-explicit saved plan, applies that exact plan, and parses `terraform output -json`.
-
-Every operation receives a UUID and private runtime directory containing its plan,
-state, generated variables, and client configuration. A JSON registry persists provider,
-location, paths, timestamps, state, public IP, non-secret resource IDs, last error, and
-expiration. Startup shows unfinished deployments for recovery or destruction. Closing
-the app warns when a selected deployment may still own resources.
-
-Automatic expiration is opt-in. The selected expiry is recorded and displayed. While
-the desktop process is running, a background monitor destroys an expired deployment
-only when the user enabled automatic expiration. If the application is closed at the
-deadline, the deployment remains in recovery for explicit destruction at next startup.
-
-## Health checks and networking
-
-After apply, the app requires a public IP and valid client configuration, then retries
-SSH for up to five minutes. It waits for cloud-init and checks the readiness marker,
-`wg-quick@wg0`, the `wg0` interface, IPv4 forwarding, NAT masquerading, and the expected
-UDP listener. Egress and DNS verification are optional because they require traffic
-through a connected client; they are disabled by default.
-
-The UI validates custom AllowedIPs, DNS IPs, port, MTU, keepalive, SSH CIDR, and expiry.
-IPv4 full tunnel is the safe default. IPv6 is disabled unless explicitly selected; the
-current cloud modules do not configure a complete routed IPv6 path, so IPv6 should be
-treated as experimental and may fail readiness/use checks.
-
-## Security model
-
-- Client X25519 keys are generated locally with the standard cryptography library; the
-  client private key is never a Terraform variable or output.
-- Runtime secret files use restrictive permissions where the operating system supports
-  them. Client files are deleted after successful destroy unless preservation is
-  explicitly requested.
-- Terraform variables carrying server keys are sensitive and outputs contain no private
-  key. Provider credentials are never interpolated into command strings.
-- Logs and actionable exceptions redact tokens, common credential forms, AWS access key
-  IDs, and WireGuard private-key lines.
-- Destroy requires a recorded UUID, an existing state file, and paths contained in the
-  known resource/runtime roots. Operations are locked per Terraform directory.
-- Terraform state necessarily contains sensitive server provisioning material. Treat
-  the entire runtime directory and all state/plan files as secrets; do not sync or share
-  them.
-
-## Extending providers and locations
-
-To add a cloud provider, add a self-contained Terraform root that consumes `region`,
-`wireguard_port`, `ssh_allowed_cidr`, `server_private_key`, `server_public_key`, and
-`client_public_key`; render the shared cloud-init template; return the four operational
-outputs used by existing roots; add catalog entries; and register an adapter in
-`providers.py`. Add mocked tests and a CI matrix entry.
-
-To add a location, edit the catalog with a unique lowercase ID, ISO country code/name,
-city, real provider region/zone, server type, capabilities, and streaming status. App
-startup rejects malformed or duplicate data. Only record `tested` when a deliberate test
-has been performed; never infer it from geography.
-
-## Tests and CI
-
-Normal tests mock commands and create no cloud resources:
+Local tests mock Terraform and cloud interactions; they never apply infrastructure:
 
 ```powershell
-.\.venv\Scripts\python -m ruff format --check vpn-gui-app tests
-.\.venv\Scripts\python -m ruff check vpn-gui-app tests
-.\.venv\Scripts\python -m mypy
-.\.venv\Scripts\python -m pytest
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m ruff format --check .
+.\.venv\Scripts\python.exe -m mypy .
 terraform fmt -check -recursive
-terraform -chdir=vpn-digitalocean init -backend=false
-terraform -chdir=vpn-digitalocean validate
 ```
 
-Repeat the last two commands for Scaleway and Lightsail. GitHub Actions runs these checks
-without credentials and never plans or applies infrastructure. Each Terraform root has
-its own committed dependency lockfile.
-
-## Troubleshooting and cleanup
-
-- Credential validation failures: set the provider environment variables in the process
-  that launches the GUI, or migrate the legacy ignored `terraform.tfvars`.
-- SSH readiness timeout: verify your key, SSH CIDR, provider username, security group,
-  cloud-init logs, and that local `ssh` is on `PATH`.
-- Failed/cancelled apply: keep the runtime registry/state and use the recovery view to
-  destroy. Never delete state before confirming the cloud resources are gone.
-- WireGuard connects without traffic: inspect forwarding, NAT, AllowedIPs, DNS, and MTU.
-- Old host key: remove only the exact ephemeral IP entry from `known_hosts`.
-
-For a complete uninstall: destroy every recovery/active deployment first; confirm the
-three cloud consoles contain no matching instances, static IPs, or firewalls; close the
-app; remove the local runtime directory shown by `EPHEMERAL_VPN_RUNTIME_DIR` or the
-platform default (`%LOCALAPPDATA%\EphemeralVpnGateway` on Windows); then remove the app
-and repository. Runtime deletion is irreversible and should happen only after cloud
-cleanup is verified.
+For provider schema validation, use `terraform init -backend=false` followed by `terraform validate`. Never run plan/apply against an unreconciled provider-root state.
 
 Licensed under the MIT License. See [LICENSE](LICENSE).

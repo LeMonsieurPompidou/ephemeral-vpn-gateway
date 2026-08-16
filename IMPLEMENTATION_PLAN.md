@@ -1,40 +1,32 @@
-# Ephemeral VPN Gateway implementation plan
+# Ephemeral VPN Gateway implementation status
 
-## Current architecture and issues
+## Reliability model
 
-- `vpn-gui-app/bridge.py` directly maps two provider names to Terraform folders and
-  executes blocking Terraform commands. There is no deployment identity, recovery,
-  cancellation, timeout, locking, readiness check, or safe destruction boundary.
-- Provider/location data is duplicated in JavaScript. Several displayed Scaleway IDs
-  (`paris-1`, for example) are not valid Terraform zone IDs.
-- Both Terraform roots generate client private keys in Terraform state and write
-  client files to the user's Desktop. SSH is unrestricted and the modules duplicate
-  cloud-init almost entirely.
-- Terraform applies without validating or consuming an explicit plan. Exceptions and
-  command output are not redacted. The dependency lock file is ignored.
-- The UI models deployment as connected/disconnected booleans and can only destroy by
-  provider, which is unsafe when an earlier or partial deployment exists.
+- Every deployment UUID owns its local-backend state, saved plan, `TF_DATA_DIR`, generated variables, WireGuard client material, temporary SSH identity, and bounded log.
+- Provider source directories are configuration-only. Existing source-root state is fingerprinted and preserved for guarded recovery.
+- Apply-risk metadata distinguishes a locally removable pre-apply operation from a deployment that may own cloud resources.
+- Operation IDs map directly to deployment IDs. Thread locks, filesystem locks, and atomic registry replacement protect concurrent local operations.
+- Terraform output JSON is validated against one typed provider contract.
 
-## Phased checklist
+## Implemented recovery behavior
 
-- [x] Inspect every Terraform, Python, JavaScript, HTML, CSS, packaging, and docs file.
-- [x] Add typed models, catalog validation, provider protocol/registry, and adapters.
-- [x] Add a persistent runtime deployment registry and explicit state transitions.
-- [x] Add a cancellable, timed, redacting Terraform runner using saved plans and JSON.
-- [x] Generate client keys/configuration locally with restrictive permissions.
-- [x] Add bounded readiness checks and safe deployment-scoped destruction.
-- [x] Refactor shared cloud-init and harden DigitalOcean and Scaleway networking.
-- [x] Add an AWS Lightsail root module and catalog entries.
-- [x] Replace hardcoded UI provider data and expose progress, logs, recovery, options,
-      expiration, copy/save/QR, and guarded destruction/close behavior.
-- [x] Add unit tests, Terraform checks, and credential-free CI.
-- [x] Update packaging, examples, lock-file policy, and complete documentation.
-- [x] Run all locally available formatting, linting, type, and unit checks.
+- Startup classifies primary and backup legacy states as empty, active, malformed, ambiguous, or migrated.
+- Unsafe legacy states block new provider deployments.
+- A state is copied into a runtime only when its provider resources and server public key match exactly one registry record. The source remains unchanged and a timestamped backup plus hashes are recorded.
+- Interrupted pre-apply work is locally removable. Interrupted apply, readiness, and destroy work is conservatively recoverable and cannot be discarded locally.
 
-## Compatibility assumptions
+## Security and UX
 
-- Existing Terraform root directories and their `region` variable remain usable from
-  the CLI. Legacy `deploy(provider, region)` and `destroy(provider)` bridge calls are
-  retained as wrappers while the UI moves to deployment UUIDs.
-- Existing cloud resources are not modified or destroyed during development or tests.
-  Cloud and Terraform calls are mocked in the automated test suite.
+- Public SSH source IPv4 `/32` is detected automatically with no open-SSH fallback.
+- Every provider imports a per-deployment Ed25519 public key; SSH always uses its matching runtime private key explicitly.
+- AWS IAM Identity Center profiles receive a real `sts get-caller-identity` preflight and actionable SSO renewal errors.
+- Lifetime is primary UI. Networking controls are advanced; MTU and keepalive are automatic.
+- Lifetime remains a local best-effort mechanism, not a provider-side TTL guarantee.
+- Confirmed destroy removes sensitive recovery artifacts; failed destroy preserves them.
+- Deployment logs are persisted, redacted, ANSI-free, and size-bounded.
+
+## Future work
+
+- Optional provider-side tagged-resource reapers can build on `deployment_id`, `expires_at`, and ownership tags.
+- Closing SSH port 22 immediately after readiness should be verified in real provider tests before enabling automatically.
+- Provider account/API behavior, key propagation timing, and public-IP-change reconciliation require real non-production end-to-end verification.

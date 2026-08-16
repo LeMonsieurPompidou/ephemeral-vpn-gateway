@@ -62,6 +62,8 @@ runtime/
 *.privatekey
 *.log
 .pytest_cache/
+.pytest-tmp*/
+.terraform-validation/
 .mypy_cache/
 .ruff_cache/
 .venv/

@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from catalog import ProviderCatalog
 from models import DeploymentOptions, Location, ProviderInfo
+from terraform_runner import TerraformCancelled
 
 
 class ProviderAdapter(Protocol):
     info: ProviderInfo
 
     def list_locations(self) -> tuple[Location, ...]: ...
-    def validate_credentials(self) -> tuple[bool, str]: ...
+
+    def validate_credentials(self, cancel: threading.Event | None = None) -> tuple[bool, str]: ...
+
     def terraform_variables(self, location: Location, options: DeploymentOptions) -> dict[str, object]: ...
 
 
@@ -27,7 +35,9 @@ class TerraformProviderAdapter:
     def list_locations(self) -> tuple[Location, ...]:
         return self.info.locations
 
-    def validate_credentials(self) -> tuple[bool, str]:
+    def validate_credentials(self, cancel: threading.Event | None = None) -> tuple[bool, str]:
+        if cancel and cancel.is_set():
+            raise TerraformCancelled("Deployment cancelled during credential validation")
         missing = [
             " or ".join(group)
             for group in self.required_environment_groups
@@ -41,8 +51,9 @@ class TerraformProviderAdapter:
         result: dict[str, object] = {
             "region": location.region,
             "wireguard_port": options.wireguard_port,
-            "ssh_allowed_cidr": options.ssh_cidr,
         }
+        if options.ssh_cidr:
+            result["ssh_allowed_cidr"] = options.ssh_cidr
         for variable, environment_name in self.variable_environment_map:
             value = os.getenv(environment_name)
             if value:
@@ -52,6 +63,59 @@ class TerraformProviderAdapter:
         return result
 
 
+class AwsLightsailAdapter(TerraformProviderAdapter):
+    def validate_credentials(self, cancel: threading.Event | None = None) -> tuple[bool, str]:
+        profile = os.getenv("AWS_PROFILE", "").strip()
+        if not profile:
+            return False, "AWS_PROFILE is not set. Set AWS_PROFILE=heres-vpn after configuring AWS IAM Identity Center."
+        executable = shutil.which("aws")
+        if not executable and sys.platform.startswith("win"):
+            normal_path = Path(r"C:\Program Files\Amazon\AWSCLIV2\aws.exe")
+            if normal_path.is_file():
+                executable = str(normal_path)
+        if not executable:
+            return False, "AWS CLI v2 was not found. Install it, then run: aws sso login --profile " + profile
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
+        try:
+            process = subprocess.Popen(
+                [executable, "sts", "get-caller-identity", "--profile", profile, "--no-cli-pager"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=creationflags,
+            )
+        except OSError:
+            return False, "AWS CLI could not be executed. Verify the AWS CLI v2 installation."
+        deadline = time.monotonic() + 20
+        while process.poll() is None:
+            if cancel and cancel.wait(0.1):
+                process.terminate()
+                raise TerraformCancelled("Deployment cancelled during AWS credential validation")
+            if time.monotonic() >= deadline:
+                process.kill()
+                return False, f"AWS credential check timed out for profile {profile}. Retry credential validation."
+            time.sleep(0.05)
+        stdout, stderr = process.communicate()
+        if process.returncode == 0:
+            return True, f"AWS credentials are valid for profile {profile}"
+        detail = (stderr or stdout).lower()
+        if any(marker in detail for marker in ("sso", "expired", "token has expired", "invalid_grant")):
+            return False, f"AWS SSO session expired. Run: aws sso login --profile {profile}"
+        if "profile" in detail and any(
+            marker in detail for marker in ("not be found", "could not be found", "does not exist")
+        ):
+            return (
+                False,
+                f"AWS profile {profile} was not found. Configure it with: aws configure sso --profile {profile}",
+            )
+        if "accessdenied" in detail or "not authorized" in detail:
+            return (
+                False,
+                f"AWS credentials for profile {profile} are not authorized for STS identity validation.",
+            )
+        return False, f"AWS credentials for profile {profile} are unavailable. Run: aws sso login --profile {profile}"
+
+
 class ResidentialProviderAdapter:
     def __init__(self, info: ProviderInfo) -> None:
         self.info = info
@@ -59,7 +123,9 @@ class ResidentialProviderAdapter:
     def list_locations(self) -> tuple[Location, ...]:
         return self.info.locations
 
-    def validate_credentials(self) -> tuple[bool, str]:
+    def validate_credentials(self, cancel: threading.Event | None = None) -> tuple[bool, str]:
+        if cancel and cancel.is_set():
+            raise TerraformCancelled("Deployment cancelled during credential validation")
         return False, "Residential nodes must be imported by the user and are not provisioned by Terraform"
 
     def terraform_variables(self, location: Location, options: DeploymentOptions) -> dict[str, object]:
@@ -70,13 +136,7 @@ class ProviderRegistry:
     def __init__(self, catalog: ProviderCatalog) -> None:
         self.catalog = catalog
         self._providers: dict[str, ProviderAdapter] = {}
-        self.register(
-            TerraformProviderAdapter(
-                catalog.get_provider("digitalocean"),
-                (("DIGITALOCEAN_TOKEN",),),
-                (("ssh_key_name", "DIGITALOCEAN_SSH_KEY_NAME"),),
-            )
-        )
+        self.register(TerraformProviderAdapter(catalog.get_provider("digitalocean"), (("DIGITALOCEAN_TOKEN",),)))
         self.register(
             TerraformProviderAdapter(
                 catalog.get_provider("scaleway"),
@@ -84,9 +144,9 @@ class ProviderRegistry:
             )
         )
         self.register(
-            TerraformProviderAdapter(
+            AwsLightsailAdapter(
                 catalog.get_provider("aws-lightsail"),
-                (("AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_WEB_IDENTITY_TOKEN_FILE"),),
+                (("AWS_PROFILE",),),
                 credential_file=Path.home() / ".aws" / "credentials",
             )
         )

@@ -85,7 +85,7 @@ class DeploymentOptions:
     enable_ipv6: bool = False
     verify_egress: bool = False
     verify_dns: bool = False
-    ssh_cidr: str = "127.0.0.1/32"
+    ssh_cidr: str | None = None
     expiration_minutes: int | None = None
     automatic_expiration: bool = False
     instance_type: str | None = None
@@ -106,6 +106,17 @@ class DeploymentRecord:
     last_error: str | None = None
     expires_at: str | None = None
     auto_expire: bool = False
+    plan_started_at: str | None = None
+    plan_completed_at: str | None = None
+    apply_started_at: str | None = None
+    apply_completed_at: str | None = None
+    destroyed_at: str | None = None
+    state_present: bool = False
+    resources_possible: bool = False
+    cleanup_status: str = "not_required"
+    legacy_source_path: str | None = None
+    legacy_source_sha256: str | None = None
+    legacy_backup_path: str | None = None
     updated_at: str = field(default_factory=lambda: now_iso())
 
     def to_dict(self) -> dict[str, Any]:
@@ -116,8 +127,10 @@ class DeploymentRecord:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "DeploymentRecord":
         copy = dict(value)
+        copy.pop("deployment_created_at", None)
         copy["state"] = DeploymentState(copy["state"])
-        return cls(**copy)
+        allowed = {field.name for field in __import__("dataclasses").fields(cls)}
+        return cls(**{key: item for key, item in copy.items() if key in allowed})
 
 
 @dataclass(frozen=True)

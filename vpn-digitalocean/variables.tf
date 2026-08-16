@@ -18,6 +18,8 @@ variable "instance_type" {
 variable "ssh_key_name" {
   description = "Existing DigitalOcean SSH key name"
   type        = string
+  default     = null
+  nullable    = true
 }
 variable "ssh_allowed_cidr" {
   description = "CIDR allowed to connect over SSH"
@@ -45,4 +47,21 @@ variable "server_public_key" {
 variable "client_public_key" {
   description = "WireGuard client public key"
   type        = string
+}
+variable "deployment_id" {
+  description = "Application deployment UUID used for ownership and unique names"
+  type        = string
+  default     = "manual"
+}
+variable "expires_at" {
+  description = "Best-effort local expiration timestamp; no cloud-side reaper is implied"
+  type        = string
+  default     = null
+  nullable    = true
+}
+variable "ssh_public_key" {
+  description = "Per-deployment OpenSSH public key registered by the application"
+  type        = string
+  default     = null
+  nullable    = true
 }

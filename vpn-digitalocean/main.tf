@@ -1,5 +1,5 @@
 locals {
-  vpn_name = "ephemeral-vpn-do"
+  vpn_name = "ephemeral-vpn-do-${substr(var.deployment_id, 0, 8)}"
   cloud_init = templatefile("${path.module}/../terraform-common/cloud-init.yaml.tftpl", {
     wireguard_port     = var.wireguard_port
     server_private_key = var.server_private_key
@@ -7,16 +7,31 @@ locals {
   })
 }
 
-data "digitalocean_ssh_key" "main" { name = var.ssh_key_name }
+data "digitalocean_ssh_key" "existing" {
+  count = var.ssh_public_key == null ? 1 : 0
+  name  = coalesce(var.ssh_key_name, "missing-key-name")
+}
+
+resource "digitalocean_ssh_key" "vpn" {
+  count      = var.ssh_public_key == null ? 0 : 1
+  name       = "${local.vpn_name}-ssh"
+  public_key = var.ssh_public_key
+}
 
 resource "digitalocean_droplet" "vpn" {
   name      = local.vpn_name
   size      = var.instance_type
   image     = "ubuntu-24-04-x64"
   region    = var.region
-  ssh_keys  = [data.digitalocean_ssh_key.main.id]
+  ssh_keys  = var.ssh_public_key == null ? [data.digitalocean_ssh_key.existing[0].id] : [digitalocean_ssh_key.vpn[0].id]
   user_data = local.cloud_init
-  tags      = ["wireguard", "ephemeral-vpn"]
+  tags      = compact(["wireguard", "ephemeral-vpn", "deployment:${var.deployment_id}", var.expires_at == null ? "" : "expires-at:${var.expires_at}"])
+  lifecycle {
+    precondition {
+      condition     = var.ssh_public_key != null || var.ssh_key_name != null
+      error_message = "Provide ssh_public_key or ssh_key_name."
+    }
+  }
 }
 
 resource "digitalocean_firewall" "vpn" {
@@ -58,7 +73,11 @@ output "server_public_key" {
 }
 output "resource_ids" {
   description = "Non-secret resource identifiers"
-  value       = { droplet_id = tostring(digitalocean_droplet.vpn.id), firewall_id = digitalocean_firewall.vpn.id }
+  value = {
+    droplet_id  = tostring(digitalocean_droplet.vpn.id)
+    firewall_id = digitalocean_firewall.vpn.id
+    ssh_key_id  = var.ssh_public_key == null ? tostring(data.digitalocean_ssh_key.existing[0].id) : tostring(digitalocean_ssh_key.vpn[0].id)
+  }
 }
 output "readiness_hint" {
   description = "Remote readiness marker created by cloud-init"
