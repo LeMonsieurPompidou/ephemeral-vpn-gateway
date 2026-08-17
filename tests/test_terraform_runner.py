@@ -13,6 +13,15 @@ def test_command_construction_and_json_parsing(tmp_path: Path) -> None:
     assert output_value(json.loads(result.stdout), "vpn_public_ip") == "1.2.3.4"
 
 
+def test_subprocess_output_is_decoded_as_utf8(tmp_path: Path) -> None:
+    runner = TerraformRunner(executable=sys.executable)
+    result = runner.run(
+        ["-c", "import sys; sys.stdout.buffer.write('│ ╵'.encode('utf-8'))"],
+        tmp_path,
+    )
+    assert result.stdout == "│ ╵\n"
+
+
 def test_timeout(tmp_path: Path) -> None:
     runner = TerraformRunner(executable=sys.executable, timeout=0.1)
     with pytest.raises(TerraformError, match="timed out"):

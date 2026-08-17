@@ -29,6 +29,8 @@ EphemeralVpnGateway\
 |-- locks\<provider>.lock
 `-- <deployment-id>\
     |-- .terraform\
+    |-- terraform-work\                 (state-free configuration copy)
+    |-- terraform-work-manifest.json
     |-- terraform.tfstate
     |-- terraform.tfstate.backup       (when Terraform creates one)
     |-- deployment.tfplan
@@ -41,7 +43,7 @@ EphemeralVpnGateway\
     `-- deployment.log
 ```
 
-Each Terraform root declares the local backend. Deployment `init` configures that backend with the absolute runtime `terraform.tfstate` path and sets a deployment-specific `TF_DATA_DIR`. Plan, saved-plan apply, output, and destroy therefore use one backend. Runtime guards reject unsafe paths and fingerprint provider-root state before and after every Terraform operation.
+Each Terraform root declares the local backend. A fresh deployment copies only Terraform configuration, the provider lockfile, optional legacy tfvars, and shared templates into its runtime working directory; provider-root state is never copied. Deployment `init` runs there with `-input=false -reconfigure`, configures the backend with the absolute runtime `terraform.tfstate` path, and sets a deployment-specific `TF_DATA_DIR`. Recovery initialization first verifies the persisted local-backend metadata and uses the same path without `-reconfigure`. Plan, saved-plan apply, output, and destroy therefore use one verified backend. Runtime guards reject unsafe paths, verify the staged configuration manifest and backend metadata, and fingerprint provider-root state before and after every Terraform operation.
 
 Provider operations also use an OS/filesystem lock. Registry replacement is atomic and registry reads/writes use a cross-process lock.
 
@@ -53,6 +55,9 @@ Older versions could write ignored `terraform.tfstate` files into `vpn-aws-light
 - The original state is never deleted, overwritten, moved, merged, or destroyed automatically.
 - Automatic migration is offered only when the primary state's provider resources and server public key match exactly one existing deployment registry record.
 - Migration creates a timestamped runtime backup, copies the state into that matched deployment's runtime, verifies hashes, and records the source and backup in registry metadata.
+- If no runtime deployment matches, **Mark stale — cloud absence confirmed** is available for a parseable active state. It requires the operator to type an explicit confirmation after independently verifying that every summarized cloud resource is absent. The action does not contact the provider or run Terraform.
+- Stale reconciliation copies the primary state and any backup to `%LOCALAPPDATA%\EphemeralVpnGateway\legacy-quarantine\<provider>\<timestamp>-<short-sha>\`, verifies the copies, and atomically stores a receipt under `legacy-reconciliations`. The provider is unblocked only while the source path, SHA-256, lineage, serial, resource/output summaries, and quarantine copies still match that receipt.
+- A migrated classification is valid only while the recorded deployment runtime still contains a parseable, provider-matching state with the same SHA-256 as the legacy source.
 - Empty or ambiguous backups require explicit operator reconciliation; the application does not guess which snapshot represents cloud reality.
 
 ## Credentials

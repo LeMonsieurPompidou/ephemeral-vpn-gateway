@@ -34,6 +34,8 @@ def test_state_backend_is_deployment_scoped(tmp_path: Path, provider_id: str, lo
     assert destroy["status"] == "success"
     assert not (runtime / "terraform.tfstate").exists()
     assert not (runtime / ".terraform").exists()
+    assert not (runtime / "terraform-work").exists()
+    assert not (runtime / "terraform-work-manifest.json").exists()
     assert not (runtime / "deployment.auto.tfvars.json").exists()
     assert not (runtime / "deployment.tfplan").exists()
     assert not (runtime / "client.privatekey").exists()

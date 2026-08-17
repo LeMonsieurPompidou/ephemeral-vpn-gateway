@@ -142,6 +142,9 @@ class BridgeService:
     def migrate_legacy_state(self, provider_id: str) -> dict[str, object]:
         return self.orchestrator.migrate_legacy_state(provider_id)
 
+    def reconcile_stale_legacy_state(self, provider_id: str, confirmed: bool) -> dict[str, object]:
+        return self.orchestrator.reconcile_stale_legacy_state(provider_id, confirmed)
+
     def get_logs(self, deployment_id: str) -> list[str]:
         persisted = self.orchestrator.get_logs(deployment_id)
         if persisted:

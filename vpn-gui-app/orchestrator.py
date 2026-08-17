@@ -11,23 +11,33 @@ import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, ContextManager
+from typing import Any, Callable, ContextManager
 
 from catalog import ProviderCatalog
 from file_lock import FileLock
+from legacy_reconciliation import LegacyReconciliationStore
 from models import DeploymentOptions, DeploymentRecord, DeploymentState, StatusEvent, now_iso
 from networking import PublicIpDetectionError, detect_public_ipv4, normalize_public_ipv4_cidr
 from output_contract import ProviderOutputs, validate_provider_outputs
 from providers import ProviderRegistry
 from runtime_registry import DeploymentRegistry
-from security import append_redacted_log, generate_ssh_keypair, generate_wireguard_keypair, redact, write_secret
-from terraform_runner import TerraformCancelled, TerraformError, TerraformRunner
+from security import (
+    append_redacted_log,
+    generate_ssh_keypair,
+    generate_wireguard_keypair,
+    redact,
+    write_secret,
+    write_secret_bytes,
+)
+from terraform_runner import CommandResult, TerraformCancelled, TerraformError, TerraformRunner
 from validation import validate_options
 
 EventCallback = Callable[[StatusEvent], None]
 LogCallback = Callable[[str, str], None]
 IpDetector = Callable[[], str]
 LEGACY_STATE_NAMES = ("terraform.tfstate", "terraform.tfstate.backup")
+TERRAFORM_WORK_ROOT = "terraform-work"
+TERRAFORM_WORK_MANIFEST = "terraform-work-manifest.json"
 PROVIDER_RESOURCE_PREFIXES = {
     "aws-lightsail": "aws_lightsail_",
     "digitalocean": "digitalocean_",
@@ -51,11 +61,14 @@ class Orchestrator:
         self.catalog = ProviderCatalog(self.resource_root / "vpn-gui-app" / "provider_catalog.json")
         self.providers = ProviderRegistry(self.catalog)
         self.deployments = DeploymentRegistry(self.runtime_root / "deployments.json")
+        self.legacy_reconciliations = LegacyReconciliationStore(self.runtime_root / "legacy-reconciliations")
         self.runner = runner or TerraformRunner()
         self.ip_detector = ip_detector
         self.readiness_timeout = readiness_timeout
         self._cancellations: dict[str, threading.Event] = {}
         self._events: list[StatusEvent] = []
+        self._legacy_snapshot_lock = threading.RLock()
+        self._legacy_confirmation_snapshots: dict[str, dict[str, object]] = {}
         self.on_event: EventCallback | None = None
         self.on_log: LogCallback | None = None
 
@@ -77,23 +90,24 @@ class Orchestrator:
         if not provider.info.terraform_root:
             raise ValueError(f"Provider {provider_id} is not Terraform-provisioned")
         directory = self._provider_directory(provider_id)
-        identifier = deployment_id or f"init-{provider_id}"
+        identifier = deployment_id or f"init-{provider_id}-{self.new_deployment_id()}"
         runtime = (self.runtime_root / identifier).resolve()
-        runtime.mkdir(parents=True, exist_ok=True)
+        runtime.mkdir(parents=True, exist_ok=False)
         state_path = runtime / "terraform.tfstate"
-        self._assert_scoped_path(runtime, state_path)
-        snapshot = self._source_state_snapshot(directory)
-        result = self.runner.run(
-            [
-                "init",
-                "-input=false",
-                "-reconfigure",
-                f"-backend-config=path={state_path}",
-            ],
-            directory,
-            env={"TF_DATA_DIR": str(runtime / ".terraform")},
+        record = DeploymentRecord(
+            identifier,
+            provider_id,
+            "initialization-only",
+            str(directory),
+            str(state_path),
+            str(runtime),
+            now_iso(),
         )
-        self._assert_source_state_unchanged(directory, snapshot)
+        self._assert_record_paths(record)
+        self._stage_terraform_configuration(record)
+        env = self._terraform_env(record)
+        with self._provider_operation_lock(provider_id, directory):
+            result = self._initialize_terraform_backend(record, env=env, cancel=threading.Event(), fresh=True)
         return {"status": "success", "output": result.stdout}
 
     def plan(
@@ -177,22 +191,13 @@ class Orchestrator:
             write_secret(runtime / "ssh.publickey", ssh_public + "\n")
             self._raise_if_cancelled(cancel)
 
+            self._stage_terraform_configuration(record)
             env = self._terraform_env(record)
             with self._provider_operation_lock(provider_id, terraform_directory):
                 self._transition(
                     record, DeploymentState.INITIALIZING, "Initializing deployment-scoped Terraform backend"
                 )
-                self._run_terraform(
-                    record,
-                    [
-                        "init",
-                        "-input=false",
-                        "-reconfigure",
-                        f"-backend-config=path={state_path}",
-                    ],
-                    env=env,
-                    cancel=cancel,
-                )
+                self._initialize_terraform_backend(record, env=env, cancel=cancel, fresh=True)
                 self._run_terraform(record, ["validate", "-no-color"], env=env, cancel=cancel)
                 self._raise_if_cancelled(cancel)
 
@@ -460,12 +465,9 @@ class Orchestrator:
         try:
             directory = Path(record.terraform_directory)
             with self._provider_operation_lock(record.provider_id, directory):
-                self._run_terraform(
-                    record,
-                    ["init", "-input=false", "-reconfigure", f"-backend-config=path={state_path}"],
-                    env=env,
-                    cancel=cancel,
-                )
+                self._validate_recovery_backend(record, env)
+                self._stage_terraform_configuration(record)
+                self._initialize_terraform_backend(record, env=env, cancel=cancel, fresh=False)
                 self._run_terraform(
                     record,
                     ["destroy", "-auto-approve", "-input=false", "-no-color", f"-var-file={var_file}"],
@@ -569,7 +571,20 @@ class Orchestrator:
                 self.deployments.save(record)
 
     def list_legacy_states(self) -> list[dict[str, object]]:
-        return [self._inspect_legacy_provider(provider_id) for provider_id in PROVIDER_RESOURCE_PREFIXES]
+        reports = [self._inspect_legacy_provider(provider_id) for provider_id in PROVIDER_RESOURCE_PREFIXES]
+        snapshots: dict[str, dict[str, object]] = {}
+        for report in reports:
+            if report["stale_reconciliation_available"]:
+                snapshots[str(report["provider_id"])] = {
+                    "primary_path": report["primary_path"],
+                    "primary_sha256": report["primary_sha256"],
+                    "primary_lineage": report["primary_lineage"],
+                    "primary_serial": report["primary_serial"],
+                    "backup_sha256": report["backup_sha256"],
+                }
+        with self._legacy_snapshot_lock:
+            self._legacy_confirmation_snapshots = snapshots
+        return reports
 
     def migrate_legacy_state(self, provider_id: str) -> dict[str, object]:
         report = self._inspect_legacy_provider(provider_id)
@@ -601,15 +616,113 @@ class Orchestrator:
         self.deployments.save(record)
         return {"status": "success", "deployment_id": record.id, "source_preserved": True}
 
+    def reconcile_stale_legacy_state(self, provider_id: str, confirmed: bool) -> dict[str, object]:
+        if confirmed is not True:
+            raise TerraformError("Explicit confirmation of independently verified cloud absence is required")
+        directory = self._provider_directory(provider_id)
+        with self._legacy_snapshot_lock:
+            displayed = self._legacy_confirmation_snapshots.pop(provider_id, None)
+        if displayed is None:
+            raise TerraformError("Legacy state must be refreshed and reviewed before reconciliation")
+
+        with self._provider_operation_lock(provider_id, directory):
+            report = self._inspect_legacy_provider(provider_id)
+            if not report["stale_reconciliation_available"]:
+                raise TerraformError("Legacy state is not eligible for stale-state reconciliation")
+            current = {
+                "primary_path": report["primary_path"],
+                "primary_sha256": report["primary_sha256"],
+                "primary_lineage": report["primary_lineage"],
+                "primary_serial": report["primary_serial"],
+                "backup_sha256": report["backup_sha256"],
+            }
+            if current != displayed:
+                raise TerraformError("Legacy state changed after it was displayed; refresh and review it again")
+
+            source = Path(str(report["primary_path"]))
+            backup = Path(str(report["backup_path"]))
+            source_snapshot = self._source_state_snapshot(directory)
+            fingerprint = str(report["primary_sha256"])
+            if (
+                source_snapshot.get(source.name) != fingerprint
+                or source_snapshot.get(backup.name) != report["backup_sha256"]
+            ):
+                raise TerraformError("Legacy state changed before quarantine creation; refresh and review it again")
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            quarantine_root = (self.runtime_root / "legacy-quarantine" / provider_id).resolve()
+            expected_root = (self.runtime_root / "legacy-quarantine").resolve()
+            if quarantine_root.parent != expected_root:
+                raise TerraformError("Unsafe legacy quarantine provider path")
+            quarantine = (quarantine_root / f"{timestamp}-{fingerprint[:12]}").resolve()
+            if quarantine.parent != quarantine_root:
+                raise TerraformError("Unsafe legacy quarantine path")
+            quarantine.mkdir(parents=True, exist_ok=False)
+            quarantine_files: list[dict[str, object]] = []
+            try:
+                for original in (source, backup):
+                    expected_sha = source_snapshot.get(original.name)
+                    if expected_sha is None:
+                        continue
+                    destination = quarantine / original.name
+                    self._copy_quarantine_file(original, destination)
+                    copied_sha = self._sha256(destination)
+                    if copied_sha != expected_sha:
+                        raise TerraformError(f"Quarantine verification failed for {original.name}")
+                    quarantine_files.append(
+                        {
+                            "source_name": original.name,
+                            "path": str(destination),
+                            "sha256": copied_sha,
+                            "size": destination.stat().st_size,
+                        }
+                    )
+                if self._source_state_snapshot(directory) != source_snapshot:
+                    raise TerraformError("Legacy state changed while quarantine copies were being created")
+            except Exception:
+                shutil.rmtree(quarantine, ignore_errors=True)
+                raise
+
+            receipt: dict[str, Any] = {
+                "version": 1,
+                "provider_id": provider_id,
+                "source_path": str(source.resolve()),
+                "source_sha256": fingerprint,
+                "source_backup_sha256": report["backup_sha256"],
+                "terraform_lineage": report["primary_lineage"],
+                "terraform_serial": report["primary_serial"],
+                "resource_count": report["primary_resources"],
+                "resources": report["resource_summary"],
+                "outputs": report["outputs_summary"],
+                "reconciled_at": now_iso(),
+                "reason": "cloud_absence_confirmed",
+                "quarantine_path": str(quarantine),
+                "quarantine_files": quarantine_files,
+                "status": "reconciled-stale",
+            }
+            receipt_path = self.legacy_reconciliations.write(provider_id, receipt)
+            verified = self._inspect_legacy_provider(provider_id)
+            if verified["classification"] != "reconciled-stale" or verified["blocking"]:
+                raise TerraformError(f"Reconciliation receipt verification failed: {verified['reason']}")
+            return {
+                "status": "success",
+                "provider_id": provider_id,
+                "classification": verified["classification"],
+                "source_preserved": True,
+                "receipt_path": str(receipt_path),
+                "quarantine_path": str(quarantine),
+            }
+
     def _inspect_legacy_provider(self, provider_id: str) -> dict[str, object]:
         directory = self._provider_directory(provider_id)
         primary = directory / "terraform.tfstate"
         backup = directory / "terraform.tfstate.backup"
         primary_info = self._inspect_state_file(primary)
         backup_info = self._inspect_state_file(backup)
+        receipt, receipt_error = self.legacy_reconciliations.read(provider_id)
         classification = "none"
         reason = "No provider-root state files detected"
         migration_available = False
+        stale_reconciliation_available = False
         blocking = False
         if primary_info["exists"] and not primary_info["parseable"]:
             classification, reason, blocking = "malformed", "Primary provider-root state is malformed", True
@@ -617,9 +730,8 @@ class Orchestrator:
             classification, reason, blocking = "malformed", "Provider-root state backup is malformed", True
         elif isinstance(primary_info["resources"], int) and primary_info["resources"] > 0:
             classification, reason, blocking = "active", "Primary provider-root state contains managed resources", True
-            migration_available = bool(
-                primary_info["identity_valid"] and self._legacy_identity_candidates(provider_id, primary)
-            )
+            candidates = self._legacy_identity_candidates(provider_id, primary)
+            migration_available = bool(primary_info["identity_valid"] and len(candidates) == 1)
         elif isinstance(backup_info["resources"], int) and backup_info["resources"] > 0:
             classification = "ambiguous"
             reason = "Primary state is empty or missing while its backup contains managed resources"
@@ -627,53 +739,312 @@ class Orchestrator:
         elif primary_info["exists"] or backup_info["exists"]:
             classification, reason = "empty", "Provider-root state files contain no managed resources"
         fingerprint = primary_info.get("sha256")
-        if fingerprint and any(
-            record.legacy_source_sha256 == fingerprint and record.provider_id == provider_id
-            for record in self.deployments.list()
+        receipt_details: dict[str, object] | None = None
+        if classification == "active" and isinstance(fingerprint, str):
+            migrated_records = [
+                record
+                for record in self.deployments.list()
+                if record.legacy_source_sha256 == fingerprint and record.provider_id == provider_id
+            ]
+            if migrated_records:
+                migrated, migration_reason = self._verify_migrated_legacy_state(
+                    provider_id, primary, fingerprint, migrated_records
+                )
+                if migrated:
+                    classification, reason, blocking = (
+                        "migrated",
+                        "Legacy state has a verified identical runtime state",
+                        False,
+                    )
+                    migration_available = False
+                else:
+                    reason = f"Recorded legacy migration is invalid: {migration_reason}"
+
+            if classification == "active":
+                if receipt_error:
+                    reason = f"Stale-state reconciliation is invalid: {receipt_error}"
+                elif receipt is not None:
+                    valid, receipt_reason, receipt_details = self._verify_stale_receipt(
+                        provider_id, primary, backup, primary_info, backup_info, receipt
+                    )
+                    if valid:
+                        classification, reason, blocking = (
+                            "reconciled-stale",
+                            "Historical state preserved; cloud absence was explicitly confirmed",
+                            False,
+                        )
+                        migration_available = False
+                    else:
+                        reason = f"Stale-state reconciliation is invalid: {receipt_reason}"
+                stale_reconciliation_available = (
+                    classification == "active"
+                    and not migration_available
+                    and isinstance(primary_info.get("lineage"), str)
+                    and bool(primary_info.get("lineage"))
+                    and isinstance(primary_info.get("serial"), int)
+                    and not isinstance(primary_info.get("serial"), bool)
+                )
+        if classification not in {"active", "migrated", "reconciled-stale"} and (
+            receipt is not None or receipt_error is not None
         ):
-            classification, reason, blocking = (
-                "migrated",
-                "Legacy state was copied to its matched runtime deployment",
-                False,
-            )
-            migration_available = False
+            classification = "unverified-stale"
+            blocking = True
+            detail = receipt_error or "the provider-root state no longer matches the recorded reconciliation"
+            reason = f"Stale-state reconciliation is invalid: {detail}"
         return {
             "provider_id": provider_id,
             "classification": classification,
             "reason": reason,
             "blocking": blocking,
             "migration_available": migration_available,
+            "stale_reconciliation_available": stale_reconciliation_available,
             "primary_path": str(primary),
             "primary_sha256": primary_info.get("sha256"),
             "primary_resources": primary_info["resources"],
+            "primary_lineage": primary_info.get("lineage"),
+            "primary_serial": primary_info.get("serial"),
+            "resource_summary": primary_info.get("resource_summary", []),
+            "outputs_summary": primary_info.get("outputs_summary", []),
             "backup_path": str(backup),
+            "backup_sha256": backup_info.get("sha256"),
             "backup_resources": backup_info["resources"],
+            "reconciliation": receipt_details,
         }
 
     def _inspect_state_file(self, path: Path) -> dict[str, object]:
         if not path.is_file():
             return {"exists": False, "parseable": False, "resources": 0, "identity_valid": False}
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            return {"exists": True, "parseable": False, "resources": 0, "identity_valid": False}
         result: dict[str, object] = {
             "exists": True,
             "parseable": False,
             "resources": 0,
             "identity_valid": False,
-            "sha256": self._sha256(path),
+            "resource_summary": [],
+            "outputs_summary": [],
+            "sha256": hashlib.sha256(payload).hexdigest(),
         }
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-            resources = [
-                item
-                for item in state.get("resources", [])
-                if isinstance(item, dict) and isinstance(item.get("instances"), list) and item["instances"]
-            ]
+            state = json.loads(payload.decode("utf-8"))
+            if not isinstance(state, dict):
+                return result
+            resources = self._summarize_state_resources(state)
+            outputs = self._summarize_state_outputs(state)
             result["parseable"] = True
             result["resources"] = len(resources)
+            result["resource_summary"] = resources
+            result["outputs_summary"] = outputs
+            result["lineage"] = state.get("lineage")
+            result["serial"] = state.get("serial")
             resource_ids = state.get("outputs", {}).get("resource_ids", {}).get("value")
             result["identity_valid"] = bool(isinstance(resource_ids, dict) and resource_ids)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
             pass
         return result
+
+    @staticmethod
+    def _summarize_state_resources(state: dict[str, Any]) -> list[dict[str, object]]:
+        summary: list[dict[str, object]] = []
+        raw_resources = state.get("resources", [])
+        if not isinstance(raw_resources, list):
+            return summary
+        for resource in raw_resources:
+            if not isinstance(resource, dict) or resource.get("mode", "managed") != "managed":
+                continue
+            resource_type = resource.get("type")
+            resource_name = resource.get("name")
+            instances = resource.get("instances")
+            if (
+                not isinstance(resource_type, str)
+                or not isinstance(resource_name, str)
+                or not isinstance(instances, list)
+            ):
+                continue
+            module = resource.get("module")
+            base_address = f"{resource_type}.{resource_name}"
+            if isinstance(module, str) and module:
+                base_address = f"{module}.{base_address}"
+            for index, instance in enumerate(instances):
+                if not isinstance(instance, dict):
+                    continue
+                index_key = instance.get("index_key")
+                address = base_address
+                if index_key is not None:
+                    address += f"[{json.dumps(index_key, ensure_ascii=True)}]"
+                elif len(instances) > 1:
+                    address += f"[{index}]"
+                identifiers: list[str] = []
+                attributes = instance.get("attributes")
+                if isinstance(attributes, dict):
+                    for key in ("id", "name", "urn"):
+                        value = attributes.get(key)
+                        if isinstance(value, (str, int)) and not isinstance(value, bool):
+                            safe = redact(str(value)).replace("\n", " ")[:256]
+                            if safe and safe not in identifiers:
+                                identifiers.append(safe)
+                summary.append(
+                    {
+                        "address": address,
+                        "type": resource_type,
+                        "identifiers": identifiers,
+                    }
+                )
+        return summary
+
+    @staticmethod
+    def _summarize_state_outputs(state: dict[str, Any]) -> list[dict[str, object]]:
+        outputs = state.get("outputs", {})
+        if not isinstance(outputs, dict):
+            return []
+        summary: list[dict[str, object]] = []
+        for name in sorted(outputs):
+            item = outputs[name]
+            if not isinstance(name, str) or not isinstance(item, dict):
+                continue
+            value = item.get("value")
+            value_type = (
+                "null"
+                if value is None
+                else "boolean"
+                if isinstance(value, bool)
+                else "number"
+                if isinstance(value, (int, float))
+                else "string"
+                if isinstance(value, str)
+                else "list"
+                if isinstance(value, list)
+                else "object"
+                if isinstance(value, dict)
+                else "unknown"
+            )
+            summary.append({"name": name, "sensitive": bool(item.get("sensitive", False)), "type": value_type})
+        return summary
+
+    def _verify_migrated_legacy_state(
+        self,
+        provider_id: str,
+        source: Path,
+        fingerprint: str,
+        records: list[DeploymentRecord],
+    ) -> tuple[bool, str]:
+        if len(records) != 1:
+            return False, "the source fingerprint is associated with multiple deployment records"
+        record = records[0]
+        try:
+            self._assert_record_paths(record)
+        except (TerraformError, ValueError) as exc:
+            return False, str(exc)
+        if record.provider_id != provider_id:
+            return False, "deployment provider does not match"
+        if not record.legacy_source_path or Path(record.legacy_source_path).resolve() != source.resolve():
+            return False, "recorded legacy source path does not match"
+        runtime_state = Path(record.state_path)
+        if not runtime_state.is_file():
+            return False, "matching runtime state is missing"
+        runtime_info = self._inspect_state_file(runtime_state)
+        if not runtime_info["parseable"]:
+            return False, "matching runtime state is malformed"
+        if runtime_info.get("sha256") != fingerprint:
+            return False, "matching runtime state fingerprint differs"
+        prefix = PROVIDER_RESOURCE_PREFIXES[provider_id]
+        resources = runtime_info.get("resource_summary")
+        if (
+            not isinstance(resources, list)
+            or not resources
+            or any(not isinstance(item, dict) or not str(item.get("type", "")).startswith(prefix) for item in resources)
+        ):
+            return False, "matching runtime state provider identity differs"
+        return True, "verified"
+
+    def _verify_stale_receipt(
+        self,
+        provider_id: str,
+        source: Path,
+        backup: Path,
+        primary_info: dict[str, object],
+        backup_info: dict[str, object],
+        receipt: dict[str, Any],
+    ) -> tuple[bool, str, dict[str, object] | None]:
+        if receipt.get("version") != 1:
+            return False, "unsupported receipt version", None
+        if receipt.get("provider_id") != provider_id:
+            return False, "receipt belongs to another provider", None
+        if receipt.get("status") != "reconciled-stale":
+            return False, "receipt status is not reconciled-stale", None
+        if receipt.get("reason") != "cloud_absence_confirmed":
+            return False, "receipt reason is invalid", None
+        if receipt.get("source_path") != str(source.resolve()):
+            return False, "source path differs from the receipt", None
+        if receipt.get("source_sha256") != primary_info.get("sha256"):
+            return False, "source fingerprint differs from the receipt", None
+        if receipt.get("source_backup_sha256") != backup_info.get("sha256"):
+            return False, "provider-root backup fingerprint differs from the receipt", None
+        if receipt.get("terraform_lineage") != primary_info.get("lineage"):
+            return False, "Terraform lineage differs from the receipt", None
+        if receipt.get("terraform_serial") != primary_info.get("serial"):
+            return False, "Terraform serial differs from the receipt", None
+        if receipt.get("resource_count") != primary_info.get("resources"):
+            return False, "managed resource count differs from the receipt", None
+        if receipt.get("resources") != primary_info.get("resource_summary"):
+            return False, "managed resource summary differs from the receipt", None
+        if receipt.get("outputs") != primary_info.get("outputs_summary"):
+            return False, "output summary differs from the receipt", None
+
+        quarantine_root = (self.runtime_root / "legacy-quarantine" / provider_id).resolve()
+        quarantine_value = receipt.get("quarantine_path")
+        if not isinstance(quarantine_value, str):
+            return False, "quarantine path is missing", None
+        quarantine = Path(quarantine_value).resolve()
+        if quarantine.parent != quarantine_root or not quarantine.is_dir():
+            return False, "quarantine directory is missing or unsafe", None
+        files = receipt.get("quarantine_files")
+        if not isinstance(files, list):
+            return False, "quarantine file manifest is missing", None
+        expected = {"terraform.tfstate": primary_info.get("sha256")}
+        if backup_info.get("sha256") is not None:
+            expected["terraform.tfstate.backup"] = backup_info.get("sha256")
+        if len(files) != len(expected):
+            return False, "quarantine file manifest is incomplete", None
+        seen: set[str] = set()
+        for item in files:
+            if not isinstance(item, dict):
+                return False, "quarantine file manifest is malformed", None
+            name = item.get("source_name")
+            path_value = item.get("path")
+            if not isinstance(name, str) or name not in expected or name in seen:
+                return False, "quarantine file manifest has an unexpected entry", None
+            if not isinstance(path_value, str):
+                return False, "quarantine file path is missing", None
+            path = Path(path_value).resolve()
+            if path.parent != quarantine or path.name != name or not path.is_file():
+                return False, f"quarantine copy for {name} is missing or unsafe", None
+            try:
+                actual_sha = self._sha256(path)
+            except OSError as exc:
+                return False, f"quarantine copy for {name} cannot be read: {exc}", None
+            if item.get("sha256") != expected[name] or actual_sha != expected[name]:
+                return False, f"quarantine copy for {name} failed fingerprint verification", None
+            seen.add(name)
+
+        reconciled_at = receipt.get("reconciled_at")
+        if not isinstance(reconciled_at, str) or not reconciled_at:
+            return False, "reconciliation timestamp is missing", None
+        details = {
+            "reconciled_at": reconciled_at,
+            "fingerprint": str(primary_info.get("sha256", "")),
+            "quarantine_path": str(quarantine),
+            "resource_count": primary_info.get("resources", 0),
+        }
+        return True, "verified", details
+
+    @staticmethod
+    def _copy_quarantine_file(source: Path, destination: Path) -> None:
+        shutil.copy2(source, destination)
+        if not destination.is_file():
+            raise TerraformError(f"Quarantine copy was not created for {source.name}")
 
     def _legacy_identity_candidates(self, provider_id: str, state_path: Path) -> list[DeploymentRecord]:
         try:
@@ -741,6 +1112,220 @@ class Orchestrator:
         if runtime == self.runtime_root or self.resource_root in (runtime, *runtime.parents):
             raise TerraformError("Deployment runtime must not be inside application resources")
 
+    def _terraform_working_directory(self, record: DeploymentRecord) -> Path:
+        runtime = Path(record.runtime_directory).resolve()
+        source = Path(record.terraform_directory).resolve()
+        work_root = (runtime / TERRAFORM_WORK_ROOT).resolve()
+        working = (work_root / source.name).resolve()
+        if work_root.parent != runtime or working.parent != work_root:
+            raise TerraformError("Terraform working directory is outside the deployment runtime")
+        return working
+
+    def _stage_terraform_configuration(self, record: DeploymentRecord) -> Path:
+        self._assert_record_paths(record)
+        runtime = Path(record.runtime_directory).resolve()
+        source = Path(record.terraform_directory).resolve()
+        work_root = (runtime / TERRAFORM_WORK_ROOT).resolve()
+        working = self._terraform_working_directory(record)
+        manifest_path = runtime / TERRAFORM_WORK_MANIFEST
+        if work_root.exists() or manifest_path.exists():
+            self._verify_terraform_work_manifest(record)
+            return working
+
+        source_files = sorted(source.glob("*.tf"))
+        lock_file = source / ".terraform.lock.hcl"
+        if not lock_file.is_file():
+            raise TerraformError("Terraform provider dependency lockfile is missing")
+        source_files.append(lock_file)
+        legacy_tfvars = source / "terraform.tfvars"
+        if legacy_tfvars.is_file():
+            source_files.append(legacy_tfvars)
+        common_source = self.resource_root / "terraform-common"
+        common_files = sorted(path for path in common_source.rglob("*") if path.is_file())
+        if not source_files or not common_files:
+            raise TerraformError("Terraform source configuration is incomplete")
+
+        entries: list[dict[str, str]] = []
+        work_root.mkdir(parents=True, exist_ok=False)
+        try:
+            working.mkdir()
+            common_destination = work_root / "terraform-common"
+            common_destination.mkdir()
+            for original in source_files:
+                destination = working / original.name
+                before = self._sha256(original)
+                if original.name == "terraform.tfvars":
+                    write_secret_bytes(destination, original.read_bytes())
+                else:
+                    shutil.copy2(original, destination)
+                if self._sha256(original) != before or self._sha256(destination) != before:
+                    raise TerraformError(f"Terraform source changed while staging {original.name}")
+                entries.append({"path": str(destination.relative_to(work_root)), "sha256": before})
+            for original in common_files:
+                relative = original.relative_to(common_source)
+                destination = common_destination / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                before = self._sha256(original)
+                shutil.copy2(original, destination)
+                if self._sha256(original) != before or self._sha256(destination) != before:
+                    raise TerraformError(f"Terraform common source changed while staging {relative}")
+                entries.append({"path": str(destination.relative_to(work_root)), "sha256": before})
+            manifest = {
+                "version": 1,
+                "provider_id": record.provider_id,
+                "source_directory": str(source),
+                "working_directory": str(working),
+                "files": entries,
+            }
+            temporary = manifest_path.with_suffix(".tmp")
+            write_secret(temporary, json.dumps(manifest, indent=2, sort_keys=True))
+            temporary.replace(manifest_path)
+            self._verify_terraform_work_manifest(record)
+            return working
+        except Exception:
+            shutil.rmtree(work_root, ignore_errors=True)
+            manifest_path.unlink(missing_ok=True)
+            raise
+
+    def _verify_terraform_work_manifest(self, record: DeploymentRecord) -> None:
+        runtime = Path(record.runtime_directory).resolve()
+        work_root = (runtime / TERRAFORM_WORK_ROOT).resolve()
+        working = self._terraform_working_directory(record)
+        manifest_path = runtime / TERRAFORM_WORK_MANIFEST
+        if not work_root.is_dir() or not working.is_dir() or not manifest_path.is_file():
+            raise TerraformError("Deployment Terraform working copy is missing or incomplete")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise TerraformError(f"Deployment Terraform working manifest is invalid: {exc}") from exc
+        if not isinstance(manifest, dict):
+            raise TerraformError("Deployment Terraform working manifest is invalid")
+        if manifest.get("version") != 1 or manifest.get("provider_id") != record.provider_id:
+            raise TerraformError("Deployment Terraform working manifest identity differs")
+        if manifest.get("source_directory") != str(Path(record.terraform_directory).resolve()):
+            raise TerraformError("Deployment Terraform source identity differs")
+        if manifest.get("working_directory") != str(working):
+            raise TerraformError("Deployment Terraform working path differs")
+        entries = manifest.get("files")
+        if not isinstance(entries, list) or not entries:
+            raise TerraformError("Deployment Terraform working manifest contains no files")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise TerraformError("Deployment Terraform working manifest is malformed")
+            relative = entry.get("path")
+            fingerprint = entry.get("sha256")
+            if not isinstance(relative, str) or not isinstance(fingerprint, str):
+                raise TerraformError("Deployment Terraform working manifest entry is malformed")
+            path = (work_root / relative).resolve()
+            if work_root not in path.parents or not path.is_file():
+                raise TerraformError("Deployment Terraform working file is missing or unsafe")
+            if self._sha256(path) != fingerprint:
+                raise TerraformError(f"Deployment Terraform working file changed: {relative}")
+        if any(working.glob("terraform.tfstate*")):
+            raise TerraformError("Terraform state must not exist in the deployment working copy")
+
+    def _backend_metadata_path(self, record: DeploymentRecord) -> Path:
+        runtime = Path(record.runtime_directory).resolve()
+        metadata = (runtime / ".terraform" / "terraform.tfstate").resolve()
+        if metadata.parent.parent != runtime:
+            raise TerraformError("Terraform backend metadata path is outside the deployment runtime")
+        return metadata
+
+    def _backend_state_path(self, record: DeploymentRecord) -> Path:
+        metadata_path = self._backend_metadata_path(record)
+        if not metadata_path.is_file():
+            raise TerraformError("Deployment backend metadata is missing")
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            backend = metadata.get("backend")
+            if not isinstance(backend, dict) or backend.get("type") != "local":
+                raise TerraformError("Deployment backend metadata is not a local backend")
+            config = backend.get("config")
+            path_value = config.get("path") if isinstance(config, dict) else None
+            if not isinstance(path_value, str) or not Path(path_value).is_absolute():
+                raise TerraformError("Deployment backend metadata has no absolute state path")
+            return Path(path_value).resolve()
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError) as exc:
+            raise TerraformError(f"Deployment backend metadata is malformed: {exc}") from exc
+
+    def _assert_terraform_data_dir(self, record: DeploymentRecord, env: dict[str, str]) -> None:
+        runtime = Path(record.runtime_directory).resolve()
+        expected = (runtime / ".terraform").resolve()
+        configured = env.get("TF_DATA_DIR")
+        if not configured or Path(configured).resolve() != expected or expected.parent != runtime:
+            raise TerraformError("TF_DATA_DIR must be the deployment runtime .terraform directory")
+
+    def _assert_backend_invariants(self, record: DeploymentRecord, env: dict[str, str]) -> None:
+        self._assert_record_paths(record)
+        self._assert_terraform_data_dir(record, env)
+        self._verify_terraform_work_manifest(record)
+        expected_state = Path(record.state_path).resolve()
+        if self._backend_state_path(record) != expected_state:
+            raise TerraformError("Deployment backend metadata points to a different Terraform state")
+
+    def _initialize_terraform_backend(
+        self,
+        record: DeploymentRecord,
+        *,
+        env: dict[str, str],
+        cancel: threading.Event,
+        fresh: bool,
+    ) -> CommandResult:
+        self._assert_terraform_data_dir(record, env)
+        state = Path(record.state_path)
+        metadata = self._backend_metadata_path(record)
+        if fresh:
+            if (
+                record.apply_started_at
+                or record.apply_completed_at
+                or record.resources_possible
+                or state.exists()
+                or metadata.exists()
+            ):
+                raise TerraformError("Fresh backend initialization refused because deployment state may already exist")
+            args = [
+                "init",
+                "-input=false",
+                "-reconfigure",
+                "-lockfile=readonly",
+                "-no-color",
+                f"-backend-config=path={state.resolve()}",
+            ]
+        else:
+            self._validate_recovery_backend(record, env)
+            args = [
+                "init",
+                "-input=false",
+                "-lockfile=readonly",
+                "-no-color",
+                f"-backend-config=path={state.resolve()}",
+            ]
+        result = self._run_terraform(record, args, env=env, cancel=cancel)
+        self._assert_backend_invariants(record, env)
+        return result
+
+    def _validate_recovery_backend(self, record: DeploymentRecord, env: dict[str, str]) -> None:
+        self._assert_record_paths(record)
+        self._assert_terraform_data_dir(record, env)
+        state = Path(record.state_path)
+        if not state.is_file():
+            raise TerraformError("Recovery backend initialization refused because deployment state is missing")
+        state_info = self._inspect_state_file(state)
+        if not state_info["parseable"]:
+            raise TerraformError("Recovery backend initialization refused because deployment state is malformed")
+        managed_resources = state_info.get("resources")
+        if not (
+            record.apply_started_at
+            or record.apply_completed_at
+            or record.resources_possible
+            or isinstance(managed_resources, int)
+            and managed_resources > 0
+        ):
+            raise TerraformError("Recovery backend initialization refused because lifecycle ownership is unproven")
+        expected_state = state.resolve()
+        if self._backend_state_path(record) != expected_state:
+            raise TerraformError("Recovery backend metadata disagrees with the recorded deployment state path")
+
     def _terraform_env(self, record: DeploymentRecord) -> dict[str, str]:
         runtime = Path(record.runtime_directory)
         return {"TF_DATA_DIR": str(runtime / ".terraform"), "TF_IN_AUTOMATION": "1"}
@@ -752,36 +1337,44 @@ class Orchestrator:
         *,
         env: dict[str, str],
         cancel: threading.Event,
-    ) -> None:
+    ) -> CommandResult:
         self._assert_record_paths(record)
-        directory = Path(record.terraform_directory)
-        snapshot = self._source_state_snapshot(directory)
+        self._assert_terraform_data_dir(record, env)
+        source_directory = Path(record.terraform_directory)
+        working_directory = self._terraform_working_directory(record)
+        self._verify_terraform_work_manifest(record)
+        snapshot = self._source_state_snapshot(source_directory)
         try:
-            self.runner.run(
+            result = self.runner.run(
                 args,
-                directory,
+                working_directory,
                 env=env,
                 cancel=cancel,
                 progress=lambda line: self._log(record.id, line),
             )
         finally:
-            self._assert_source_state_unchanged(directory, snapshot)
+            self._assert_source_state_unchanged(source_directory, snapshot)
+        self._assert_backend_invariants(record, env)
+        return result
 
     def _terraform_outputs(
         self, record: DeploymentRecord, *, env: dict[str, str], cancel: threading.Event
     ) -> dict[str, object]:
         self._assert_record_paths(record)
-        directory = Path(record.terraform_directory)
-        snapshot = self._source_state_snapshot(directory)
+        self._assert_backend_invariants(record, env)
+        source_directory = Path(record.terraform_directory)
+        working_directory = self._terraform_working_directory(record)
+        snapshot = self._source_state_snapshot(source_directory)
         try:
             return self.runner.output_json(
-                directory,
+                working_directory,
                 env=env,
                 cancel=cancel,
                 progress=lambda line: self._log(record.id, line),
             )
         finally:
-            self._assert_source_state_unchanged(directory, snapshot)
+            self._assert_source_state_unchanged(source_directory, snapshot)
+            self._assert_backend_invariants(record, env)
 
     def _provider_operation_lock(self, provider_id: str, directory: Path) -> ContextManager[None]:
         thread_lock = self.runner.lock_for(directory)
@@ -887,6 +1480,10 @@ class Orchestrator:
         terraform_data = runtime / ".terraform"
         if terraform_data.is_dir():
             shutil.rmtree(terraform_data)
+        terraform_work = runtime / TERRAFORM_WORK_ROOT
+        if terraform_work.is_dir():
+            shutil.rmtree(terraform_work)
+        (runtime / TERRAFORM_WORK_MANIFEST).unlink(missing_ok=True)
 
     def _transition(
         self, record: DeploymentRecord, state: DeploymentState, message: str, error: str | None = None

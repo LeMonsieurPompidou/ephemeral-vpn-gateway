@@ -400,6 +400,8 @@ select, input { width: 100%; padding: 11px 12px; border: 1px solid var(--border)
 .link-btn { border: 0; color: var(--primary); background: transparent; cursor: pointer; font-weight: 650; }
 .logs { max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: #111827; color: #d1fae5; border-radius: 12px; padding: 12px; font-size: 11px; margin-top: 10px; }
 .recovery-item { display: block; width: 100%; text-align: left; padding: 10px; margin-top: 8px; border: 1px solid var(--border); background: white; border-radius: 10px; cursor: pointer; }
+.legacy-item { cursor: default; }
+.legacy-item > .btn, .legacy-item > details { margin-top: 10px; }
 .status-indicator.ready { background: var(--success); }.status-indicator.failed,.status-indicator.cancelled { background: var(--danger); }
 
 @media (max-width: 640px) {

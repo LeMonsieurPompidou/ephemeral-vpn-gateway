@@ -51,13 +51,17 @@ def generate_ssh_keypair() -> tuple[str, str]:
 
 
 def write_secret(path: Path, content: str) -> None:
+    write_secret_bytes(path, content.encode("utf-8"))
+
+
+def write_secret_bytes(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
     fd = os.open(path, flags, 0o600)
     try:
-        os.write(fd, content.encode("utf-8"))
+        os.write(fd, content)
     finally:
         os.close(fd)
     try:

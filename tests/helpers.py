@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 from typing import Callable
@@ -22,6 +23,7 @@ def make_resource_root(tmp_path: Path) -> Path:
         destination.mkdir()
         for source in (ROOT / name).glob("*.tf"):
             shutil.copy2(source, destination / source.name)
+        shutil.copy2(ROOT / name / ".terraform.lock.hcl", destination / ".terraform.lock.hcl")
     return root
 
 
@@ -40,7 +42,19 @@ class FakeTerraformRunner(TerraformRunner):
         command = args[0]
         if command == "init":
             backend = next(value for value in args if value.startswith("-backend-config=path="))
-            self.state_by_data_dir[env["TF_DATA_DIR"]] = Path(backend.split("=", 2)[2])
+            state_path = Path(backend.split("=", 2)[2])
+            self.state_by_data_dir[env["TF_DATA_DIR"]] = state_path
+            metadata = Path(env["TF_DATA_DIR"]) / "terraform.tfstate"
+            metadata.parent.mkdir(parents=True, exist_ok=True)
+            metadata.write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "backend": {"type": "local", "config": {"path": str(state_path.resolve())}},
+                    }
+                ),
+                encoding="utf-8",
+            )
         if command == "apply":
             state = self.state_by_data_dir[env["TF_DATA_DIR"]]
             state.parent.mkdir(parents=True, exist_ok=True)
@@ -108,6 +122,7 @@ def legacy_state(provider_id: str, server_public_key: str = "server-public") -> 
     return {
         "version": 4,
         "lineage": "lineage",
+        "serial": 5,
         "outputs": {
             "server_public_key": {"value": server_public_key},
             "resource_ids": {"value": {"server": "one"}},

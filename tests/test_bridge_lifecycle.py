@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from bridge import BridgeService
 from helpers import add_record, make_resource_root
 from models import DeploymentState
@@ -93,3 +94,26 @@ def test_overdue_deployment_survives_registry_restart(tmp_path: Path, monkeypatc
     monkeypatch.setattr(restarted.orchestrator, "destroy", destroy)
     restarted._expiration_pass(datetime.now(timezone.utc))
     assert calls == ["overdue"]
+
+
+def test_recovery_list_reflects_record_removed_between_refreshes(tmp_path: Path) -> None:
+    bridge = BridgeService(
+        make_resource_root(tmp_path),
+        tmp_path / "runtime",
+        start_expiration_monitor=False,
+        acquire_app_lock=False,
+    )
+    record = add_record(bridge.orchestrator, "aws-lightsail", "cancelled")
+    record.state = DeploymentState.CANCELLED
+    record.resources_possible = False
+    record.apply_started_at = None
+    bridge.orchestrator.deployments.save(record)
+
+    assert [item["id"] for item in bridge.list_recovery_deployments()] == ["cancelled"]
+    bridge.orchestrator.deployments.remove(record.id)
+
+    assert bridge.list_recovery_deployments() == []
+    with pytest.raises(KeyError, match="Unknown deployment"):
+        bridge.get_status(record.id)
+    with pytest.raises(KeyError, match="Unknown deployment"):
+        bridge.remove_local_deployment(record.id)
