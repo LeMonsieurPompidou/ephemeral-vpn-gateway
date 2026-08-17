@@ -61,5 +61,5 @@ output "resource_ids" {
 }
 output "readiness_hint" {
   description = "Remote readiness marker created by cloud-init"
-  value       = "/var/lib/cloud/instance/wireguard-ready"
+  value       = "/var/lib/ephemeral-vpn/ready"
 }

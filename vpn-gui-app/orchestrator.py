@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -22,10 +24,12 @@ from output_contract import ProviderOutputs, validate_provider_outputs
 from providers import ProviderRegistry
 from runtime_registry import DeploymentRegistry
 from security import (
+    PrivateFileSecurityError,
     append_redacted_log,
     generate_ssh_keypair,
     generate_wireguard_keypair,
     redact,
+    verify_private_file,
     write_secret,
     write_secret_bytes,
 )
@@ -301,8 +305,13 @@ class Orchestrator:
         config = self._render_client_config(record.public_ip or "", outputs.server_public_key, client_private, options)
         self._validate_client_config(config)
         write_secret(Path(record.runtime_directory) / "client.conf", config)
-        self._transition(record, DeploymentState.CHECKING_WIREGUARD, "Checking cloud-init and WireGuard over SSH")
-        self._ssh_health_checks(record, options, cancel, automatic_ssh_cidr=automatic_ssh_cidr)
+        self._ssh_health_checks(
+            record,
+            options,
+            cancel,
+            automatic_ssh_cidr=automatic_ssh_cidr,
+            readiness_marker=outputs.readiness_hint,
+        )
         if options.verify_egress:
             self._raise_if_cancelled(cancel)
             self._transition(
@@ -318,17 +327,23 @@ class Orchestrator:
         cancel: threading.Event,
         *,
         automatic_ssh_cidr: bool,
+        readiness_marker: str = "/var/lib/ephemeral-vpn/ready",
     ) -> None:
         assert record.public_ip
+        self._raise_if_cancelled(cancel)
         deadline = time.monotonic() + self.readiness_timeout
         last_error = "SSH did not become ready"
         user = "ubuntu" if record.provider_id == "aws-lightsail" else "root"
         runtime = Path(record.runtime_directory)
         identity = runtime / "ssh.privatekey"
         known_hosts = runtime / "known_hosts"
-        remote_check = (
-            "cloud-init status --wait >/dev/null && "
-            "test -f /var/lib/cloud/instance/wireguard-ready && "
+        try:
+            verify_private_file(identity)
+        except PrivateFileSecurityError as exc:
+            raise TerraformError(f"Local SSH private-key security check failed: {exc}") from exc
+        wireguard_check = (
+            f"test -f {readiness_marker} && "
+            "systemctl is-enabled --quiet wg-quick@wg0 && "
             "systemctl is-active --quiet wg-quick@wg0 && "
             "ip link show wg0 >/dev/null && "
             'test "$(sysctl -n net.ipv4.ip_forward)" = 1 && '
@@ -337,35 +352,40 @@ class Orchestrator:
         )
         attempts = 0
         ip_refresh_attempted = False
+        cloud_init_complete = False
         while time.monotonic() < deadline:
             self._raise_if_cancelled(cancel)
             attempts += 1
             try:
                 with socket.create_connection((record.public_ip, 22), timeout=3):
                     pass
-                args = [
-                    "ssh",
-                    "-i",
-                    str(identity),
-                    "-o",
-                    "IdentitiesOnly=yes",
-                    "-o",
-                    "PasswordAuthentication=no",
-                    "-o",
-                    "KbdInteractiveAuthentication=no",
-                    "-o",
-                    "ConnectTimeout=10",
-                    "-o",
-                    "StrictHostKeyChecking=accept-new",
-                    "-o",
-                    f"UserKnownHostsFile={known_hosts}",
-                    f"{user}@{record.public_ip}",
-                    remote_check,
-                ]
-                returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=45)
-                if returncode == 0:
-                    return
-                last_error = redact((stderr or stdout).strip())[-500:]
+                if not cloud_init_complete:
+                    args = self._ssh_command(identity, known_hosts, user, record.public_ip, "cloud-init status --long")
+                    returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=20)
+                    combined = (stdout + "\n" + stderr).strip()
+                    status = self._cloud_init_status(returncode, combined)
+                    if status == "error":
+                        diagnostic = self._cloud_init_failure_diagnostic(combined)
+                        detail = f" Failed phase: {diagnostic}." if diagnostic else ""
+                        raise TerraformError(
+                            "Cloud initialization failed during bootstrap. "
+                            f"Cloud resources may exist and must be destroyed.{detail}"
+                        )
+                    if status != "done":
+                        last_error = "Cloud initialization is still running"
+                    else:
+                        cloud_init_complete = True
+                        self._transition(
+                            record,
+                            DeploymentState.CHECKING_WIREGUARD,
+                            "Cloud initialization succeeded; checking WireGuard readiness",
+                        )
+                if cloud_init_complete:
+                    args = self._ssh_command(identity, known_hosts, user, record.public_ip, wireguard_check)
+                    returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=20)
+                    if returncode == 0:
+                        return
+                    last_error = redact((stderr or stdout).strip())[-500:] or "WireGuard is not ready"
             except TerraformCancelled:
                 raise
             except (OSError, subprocess.SubprocessError) as exc:
@@ -383,6 +403,47 @@ class Orchestrator:
             if cancel.wait(5):
                 raise TerraformCancelled("Deployment cancelled during server readiness checks")
         raise TerraformError(f"Server readiness checks timed out: {last_error}")
+
+    @staticmethod
+    def _ssh_command(identity: Path, known_hosts: Path, user: str, public_ip: str, remote_command: str) -> list[str]:
+        return [
+            "ssh",
+            "-i",
+            str(identity),
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            f"UserKnownHostsFile={known_hosts}",
+            f"{user}@{public_ip}",
+            remote_command,
+        ]
+
+    @staticmethod
+    def _cloud_init_status(returncode: int, output: str) -> str:
+        match = re.search(r"(?im)^status:\s*([a-z_-]+)", output)
+        status = match.group(1).lower() if match else ""
+        if status == "error" or (returncode not in {0, 255} and "error" in output.lower()):
+            return "error"
+        if status == "done" and returncode == 0:
+            return "done"
+        if status in {"running", "not-run", "not_run"} or returncode == 255:
+            return "running"
+        return "error" if returncode else "running"
+
+    @staticmethod
+    def _cloud_init_failure_diagnostic(output: str) -> str | None:
+        match = re.search(
+            r"ephemeral-vpn bootstrap failed in phase ([A-Za-z0-9 /_-]{1,80})", output, flags=re.IGNORECASE
+        )
+        return match.group(1).strip() if match else None
 
     def _refresh_ssh_firewall(self, record: DeploymentRecord, cidr: str, cancel: threading.Event) -> None:
         runtime = Path(record.runtime_directory)
@@ -1440,7 +1501,16 @@ class Orchestrator:
 
     @staticmethod
     def _run_cancellable_process(args: list[str], cancel: threading.Event, *, timeout: float) -> tuple[int, str, str]:
-        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
+        process = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+        )
         deadline = time.monotonic() + timeout
         while process.poll() is None:
             if cancel.wait(0.1):

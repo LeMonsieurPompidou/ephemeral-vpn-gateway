@@ -77,6 +77,28 @@ def test_readiness_cancellation_requires_cloud_cleanup(tmp_path: Path) -> None:
     assert record.apply_completed_at
 
 
+def test_cloud_init_failure_after_apply_preserves_state_and_requires_destroy(tmp_path: Path) -> None:
+    orchestrator = make_orchestrator(tmp_path)
+
+    def cloud_init_failed(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise TerraformError(
+            "Cloud initialization failed during bootstrap. Cloud resources may exist and must be destroyed."
+        )
+
+    orchestrator._basic_health_checks = cloud_init_failed  # type: ignore[method-assign]
+    result = orchestrator.deploy("aws-lightsail", "us-east-1")
+    record = orchestrator.deployments.get(str(result["deployment_id"]))
+    assert result["status"] == "error"
+    assert record.state is DeploymentState.FAILED
+    assert record.apply_completed_at
+    assert record.resources_possible
+    assert record.state_present
+    assert record.cleanup_status == "required"
+    assert Path(record.state_path).is_file()
+    with pytest.raises(TerraformError, match="blocked"):
+        orchestrator.remove_local_deployment(record.id)
+
+
 def test_credential_validation_cancellation_is_local_only(tmp_path: Path) -> None:
     orchestrator = make_orchestrator(tmp_path)
 

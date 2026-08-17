@@ -103,14 +103,14 @@ class BridgeService:
             if not thread:
                 return {"status": "error", "message": "Unknown operation"}
             result = self._operation_results.get(operation_id)
-            if result is not None:
-                return {"status": "complete", "result": result}
             deployment_id = self._operation_deployments[operation_id]
-            try:
-                deployment = self.orchestrator.get_status(deployment_id)
-            except KeyError:
-                deployment = {"id": deployment_id, "state": "validating_credentials"}
-            return {"status": "running", "deployment": deployment}
+        try:
+            deployment = self.orchestrator.get_status(deployment_id)
+        except KeyError:
+            deployment = {"id": deployment_id, "state": "validating_credentials"}
+        if result is not None:
+            return {"status": "complete", "result": result, "deployment": deployment}
+        return {"status": "running", "deployment": deployment}
 
     def destroy(self, deployment_id: str, preserve_config: bool = False) -> dict[str, object]:
         # Compatibility: old clients passed a provider. Resolve only if unambiguous.

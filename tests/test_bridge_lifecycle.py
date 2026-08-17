@@ -42,6 +42,32 @@ def test_operation_status_is_bound_to_its_deployment(tmp_path: Path, monkeypatch
     assert first["deployment_id"] != second["deployment_id"]
 
 
+def test_operation_status_and_logs_reconcile_from_persisted_deployment(tmp_path: Path) -> None:
+    bridge = BridgeService(
+        make_resource_root(tmp_path),
+        tmp_path / "runtime",
+        start_expiration_monitor=False,
+        acquire_app_lock=False,
+    )
+    record = add_record(bridge.orchestrator, "aws-lightsail", "active")
+    record.state = DeploymentState.PLANNING
+    bridge.orchestrator.deployments.save(record)
+    Path(record.runtime_directory, "deployment.log").write_text("Initializing\nPlanning\n", encoding="utf-8")
+    operation_id = "operation"
+    bridge._operations[operation_id] = threading.Thread()
+    bridge._operation_deployments[operation_id] = record.id
+
+    first = bridge.operation_status(operation_id)
+    assert first["status"] == "running"
+    assert first["deployment"]["state"] == "planning"  # type: ignore[index]
+    assert bridge.get_logs(record.id) == ["Initializing", "Planning"]
+
+    record.state = DeploymentState.PROVISIONING
+    bridge.orchestrator.deployments.save(record)
+    second = bridge.operation_status(operation_id)
+    assert second["deployment"]["state"] == "provisioning"  # type: ignore[index]
+
+
 def test_expiration_failure_does_not_stop_other_cleanup(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     bridge = BridgeService(
         make_resource_root(tmp_path),

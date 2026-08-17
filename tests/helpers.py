@@ -71,7 +71,7 @@ class FakeTerraformRunner(TerraformRunner):
         return {
             "vpn_public_ip": {"value": "203.0.113.10"},
             "server_public_key": {"value": "server-public"},
-            "readiness_hint": {"value": "/var/lib/cloud/instance/wireguard-ready"},
+            "readiness_hint": {"value": "/var/lib/ephemeral-vpn/ready"},
             "resource_ids": {"value": {"server": "resource-1"}},
         }
 

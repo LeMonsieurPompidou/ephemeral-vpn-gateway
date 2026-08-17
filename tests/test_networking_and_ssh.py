@@ -5,10 +5,13 @@ import threading
 from pathlib import Path
 
 import networking
+import orchestrator as orchestrator_module
 import pytest
 from helpers import add_record, make_orchestrator
 from models import DeploymentOptions
 from networking import PublicIpDetectionError, detect_public_ipv4, normalize_public_ipv4_cidr
+from security import PrivateFileSecurityError
+from terraform_runner import TerraformError
 
 
 class Response:
@@ -61,10 +64,13 @@ def test_ssh_command_uses_explicit_deployment_identity(tmp_path: Path, monkeypat
             return None
 
     monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: Connection())
+    monkeypatch.setattr(orchestrator_module, "verify_private_file", lambda path: None)
     captured: list[str] = []
 
     def run(args, cancel, *, timeout):  # type: ignore[no-untyped-def]
         captured.extend(args)
+        if args[-1] == "cloud-init status --long":
+            return 0, "status: done", ""
         return 0, "", ""
 
     monkeypatch.setattr(orchestrator, "_run_cancellable_process", run)
@@ -107,8 +113,13 @@ def test_changed_public_ip_refreshes_firewall_once(tmp_path: Path, monkeypatch) 
 
     refreshed: list[str] = []
     monkeypatch.setattr(socket, "create_connection", connect)
+    monkeypatch.setattr(orchestrator_module, "verify_private_file", lambda path: None)
     monkeypatch.setattr(orchestrator, "_refresh_ssh_firewall", lambda record, cidr, cancel: refreshed.append(cidr))
-    monkeypatch.setattr(orchestrator, "_run_cancellable_process", lambda *args, **kwargs: (0, "", ""))
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_cancellable_process",
+        lambda args, *unused, **kwargs: (0, "status: done" if args[-1] == "cloud-init status --long" else "", ""),
+    )
     orchestrator._ssh_health_checks(
         record,
         DeploymentOptions(ssh_cidr="8.8.8.8/32"),
@@ -131,3 +142,71 @@ def test_ssh_readiness_honors_cancellation(tmp_path: Path) -> None:
             cancelled,
             automatic_ssh_cidr=False,
         )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "output", "expected"),
+    [(0, "status: running", "running"), (0, "status: done", "done"), (2, "status: error", "error")],
+)
+def test_cloud_init_status_is_classified(returncode: int, output: str, expected: str) -> None:
+    assert orchestrator_module.Orchestrator._cloud_init_status(returncode, output) == expected
+
+
+def test_cloud_init_error_fails_immediately_with_sanitized_phase(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    Path(record.runtime_directory, "ssh.privatekey").write_text("private", encoding="utf-8")
+
+    class Connection:
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return None
+
+    calls = 0
+
+    def run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return 2, "status: error\nephemeral-vpn bootstrap failed in phase SSH hardening/configuration", ""
+
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: Connection())
+    monkeypatch.setattr(orchestrator_module, "verify_private_file", lambda path: None)
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", run)
+    with pytest.raises(TerraformError, match="must be destroyed.*SSH hardening/configuration"):
+        orchestrator._ssh_health_checks(
+            record,
+            DeploymentOptions(ssh_cidr="8.8.8.8/32"),
+            threading.Event(),
+            automatic_ssh_cidr=False,
+        )
+    assert calls == 1
+
+
+def test_invalid_private_key_permissions_prevent_any_ssh_attempt(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    Path(record.runtime_directory, "ssh.privatekey").write_text("private", encoding="utf-8")
+    socket_attempted = False
+
+    def connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal socket_attempted
+        socket_attempted = True
+        raise AssertionError("SSH networking must not be attempted")
+
+    def invalid(path: Path) -> None:
+        raise PrivateFileSecurityError("unrelated principal can read the key")
+
+    monkeypatch.setattr(socket, "create_connection", connect)
+    monkeypatch.setattr(orchestrator_module, "verify_private_file", invalid)
+    with pytest.raises(TerraformError, match="Local SSH private-key security check failed"):
+        orchestrator._ssh_health_checks(
+            record,
+            DeploymentOptions(ssh_cidr="8.8.8.8/32"),
+            threading.Event(),
+            automatic_ssh_cidr=False,
+        )
+    assert not socket_attempted

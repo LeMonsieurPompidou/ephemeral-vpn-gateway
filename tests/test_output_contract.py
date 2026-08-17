@@ -12,7 +12,7 @@ def valid_outputs() -> dict[str, object]:
     return {
         "vpn_public_ip": {"value": "203.0.113.1"},
         "server_public_key": {"value": "public"},
-        "readiness_hint": {"value": "/ready"},
+        "readiness_hint": {"value": "/var/lib/ephemeral-vpn/ready"},
         "resource_ids": {"value": {"server": "one"}},
     }
 

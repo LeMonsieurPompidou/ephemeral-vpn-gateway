@@ -11,6 +11,7 @@ REQUIRED_TERRAFORM_OUTPUTS = {
     "readiness_hint": str,
     "resource_ids": dict,
 }
+EXPECTED_READINESS_MARKER = "/var/lib/ephemeral-vpn/ready"
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,9 @@ def validate_provider_outputs(outputs: dict[str, object], *, provider_id: str, d
             continue
         if isinstance(value, str) and not value.strip():
             problems.append(f"{name}: must not be empty")
+            continue
+        if name == "readiness_hint" and value != EXPECTED_READINESS_MARKER:
+            problems.append(f"{name}: must equal {EXPECTED_READINESS_MARKER}")
             continue
         values[name] = value
     if problems:
