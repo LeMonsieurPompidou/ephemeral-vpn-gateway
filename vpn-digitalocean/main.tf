@@ -1,10 +1,12 @@
 locals {
-  vpn_name = "ephemeral-vpn-do-${substr(var.deployment_id, 0, 8)}"
-  bootstrap_script = replace(replace(replace(
-    file("${path.module}/../terraform-common/bootstrap.sh.tftpl"),
+  vpn_name         = "ephemeral-vpn-do-${substr(var.deployment_id, 0, 8)}"
+  bootstrap_source = file("${path.module}/../terraform-common/bootstrap.sh.tftpl")
+  bootstrap_script = replace(replace(replace(replace(
+    local.bootstrap_source,
     "@@WIREGUARD_PORT@@", tostring(var.wireguard_port)),
     "@@SERVER_PRIVATE_KEY@@", var.server_private_key),
-  "@@CLIENT_PUBLIC_KEY@@", var.client_public_key)
+    "@@CLIENT_PUBLIC_KEY@@", var.client_public_key),
+  "@@BOOTSTRAP_FINGERPRINT@@", substr(sha256(local.bootstrap_source), 0, 12))
   cloud_init = replace(
     file("${path.module}/../terraform-common/cloud-init.yaml.tftpl"),
     "@@BOOTSTRAP_SCRIPT@@",

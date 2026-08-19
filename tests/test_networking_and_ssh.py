@@ -170,19 +170,74 @@ def test_cloud_init_error_fails_immediately_with_sanitized_phase(tmp_path: Path,
     def run(*args, **kwargs):  # type: ignore[no-untyped-def]
         nonlocal calls
         calls += 1
-        return 2, "status: error\nephemeral-vpn bootstrap failed in phase SSH hardening/configuration", ""
+        if calls == 1:
+            return 2, "status: error", ""
+        return 0, "ephemeral-vpn bootstrap failed in phase SSH hardening/configuration", ""
 
     monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: Connection())
     monkeypatch.setattr(orchestrator_module, "verify_private_file", lambda path: None)
     monkeypatch.setattr(orchestrator, "_run_cancellable_process", run)
-    with pytest.raises(TerraformError, match="must be destroyed.*SSH hardening/configuration"):
+    with pytest.raises(TerraformError, match="during SSH hardening/configuration.*must be destroyed"):
         orchestrator._ssh_health_checks(
             record,
             DeploymentOptions(ssh_cidr="8.8.8.8/32"),
             threading.Event(),
             automatic_ssh_cidr=False,
         )
-    assert calls == 1
+    assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("phase", "category"),
+    [
+        ("prerequisite installation", "apt-get-install"),
+        ("SSH hardening/configuration", "ssh-service-restart"),
+        ("WireGuard configuration", "wireguard-configuration"),
+    ],
+)
+def test_cloud_init_error_uses_persisted_safe_failure_diagnostic(
+    tmp_path: Path, monkeypatch, phase: str, category: str
+) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    Path(record.runtime_directory, "ssh.privatekey").write_text("private", encoding="utf-8")
+
+    class Connection:
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return None
+
+    outputs = iter(
+        [
+            (2, "status: error", ""),
+            (
+                0,
+                "ephemeral-vpn bootstrap failure: "
+                f"phase={phase} category={category} exit=1 line=42 build=0123456789ab\n"
+                "PrivateKey = must-not-appear",
+                "",
+            ),
+        ]
+    )
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: Connection())
+    monkeypatch.setattr(orchestrator_module, "verify_private_file", lambda path: None)
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", lambda *args, **kwargs: next(outputs))
+    with pytest.raises(TerraformError) as raised:
+        orchestrator._ssh_health_checks(
+            record,
+            DeploymentOptions(ssh_cidr="8.8.8.8/32"),
+            threading.Event(),
+            automatic_ssh_cidr=False,
+        )
+    message = str(raised.value)
+    assert phase in message
+    assert category in message
+    assert "exit 1" in message
+    assert "build 0123456789ab" in message
+    assert "must-not-appear" not in message
 
 
 def test_invalid_private_key_permissions_prevent_any_ssh_attempt(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

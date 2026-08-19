@@ -3,41 +3,68 @@ set -Eeuo pipefail
 umask 077
 
 READY_MARKER=/var/lib/ephemeral-vpn/ready
+FAILURE_MARKER=/var/lib/ephemeral-vpn/bootstrap-failure
+BOOTSTRAP_BUILD=@@BOOTSTRAP_FINGERPRINT@@
 phase="prerequisite installation"
-trap 'code=$?; echo "ephemeral-vpn bootstrap failed in phase ${phase} (exit ${code})" >&2; exit "${code}"' ERR
+command_category="bootstrap-initialization"
+
+record_bootstrap_failure() {
+  local code="$1" line="$2" diagnostic temporary
+  trap - ERR
+  diagnostic="ephemeral-vpn bootstrap failure: phase=${phase} category=${command_category} exit=${code} line=${line} build=${BOOTSTRAP_BUILD}"
+  echo "${diagnostic}" >&2
+  if install -d -m 0755 "$(dirname "${FAILURE_MARKER}")"; then
+    temporary="${FAILURE_MARKER}.tmp"
+    if printf '%s\n' "${diagnostic}" > "${temporary}" && chmod 0644 "${temporary}"; then
+      if ! mv -f "${temporary}" "${FAILURE_MARKER}"; then
+        echo "ephemeral-vpn bootstrap: could not persist failure diagnostic" >&2
+      fi
+    fi
+  fi
+  exit "${code}"
+}
+
+trap 'record_bootstrap_failure "$?" "$LINENO"' ERR
+echo "ephemeral-vpn bootstrap build: ${BOOTSTRAP_BUILD}"
 echo "ephemeral-vpn bootstrap phase: ${phase}"
+install -d -m 0755 /var/lib/ephemeral-vpn
 rm -f "${READY_MARKER}"
+rm -f "${FAILURE_MARKER}"
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v wg >/dev/null || ! command -v wg-quick >/dev/null || ! command -v iptables >/dev/null; then
   echo "ephemeral-vpn bootstrap: refreshing package indexes"
+  command_category="apt-get-update"
   if apt-get update; then
     echo "ephemeral-vpn bootstrap: package indexes refreshed"
   else
     package_status=$?
     echo "ephemeral-vpn bootstrap: apt-get update failed (exit ${package_status})" >&2
-    exit "${package_status}"
+    record_bootstrap_failure "${package_status}" "${LINENO}"
   fi
 
   # Ubuntu Noble's APT hook runs needrestart in automatic mode. Suspend that
   # scanner for this transaction; SSH is validated and restarted explicitly
   # in the controlled phase below. Other APT/dpkg failures remain fatal.
   echo "ephemeral-vpn bootstrap: automatic needrestart hook suspended for prerequisite installation"
+  command_category="apt-get-install"
   if NEEDRESTART_SUSPEND=1 apt-get install -y iptables wireguard; then
     echo "ephemeral-vpn bootstrap: package installation completed"
   else
     package_status=$?
     echo "ephemeral-vpn bootstrap: package installation failed (apt-get exit ${package_status}); inspect preceding apt/dpkg output" >&2
-    exit "${package_status}"
+    record_bootstrap_failure "${package_status}" "${LINENO}"
   fi
 else
   echo "ephemeral-vpn bootstrap: prerequisite packages already present"
 fi
+command_category="prerequisite-validation"
 command -v systemctl >/dev/null
 command -v iptables >/dev/null
 command -v wg >/dev/null
 command -v wg-quick >/dev/null
 
 phase="SSH hardening/configuration"
+command_category="ssh-configuration"
 echo "ephemeral-vpn bootstrap phase: ${phase}"
 install -d -m 0755 /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/99-ephemeral-vpn.conf <<'SSH_CONFIG'
@@ -48,6 +75,7 @@ PermitRootLogin prohibit-password
 SSH_CONFIG
 chmod 0644 /etc/ssh/sshd_config.d/99-ephemeral-vpn.conf
 command -v sshd >/dev/null
+command_category="ssh-config-validation"
 sshd -t
 
 # On-disk unit inspection can disagree with the running manager until
@@ -75,15 +103,19 @@ resolve_ssh_service() {
   return 1
 }
 
+command_category="ssh-service-resolution"
 if ! ssh_service="$(resolve_ssh_service)"; then
   echo "ephemeral-vpn bootstrap: no loaded OpenSSH systemd service found" >&2
-  exit 1
+  record_bootstrap_failure 1 "${LINENO}"
 fi
 echo "ephemeral-vpn ssh unit selected: ${ssh_service}"
+command_category="ssh-service-restart"
 systemctl restart "${ssh_service}"
+command_category="ssh-service-active-verification"
 systemctl is-active --quiet "${ssh_service}"
 
 phase="WireGuard configuration"
+command_category="wireguard-configuration"
 echo "ephemeral-vpn bootstrap phase: ${phase}"
 install -d -m 0700 /etc/wireguard
 cat > /etc/wireguard/wg0.conf <<'WG_CONFIG'
@@ -102,6 +134,7 @@ chmod 0600 /etc/wireguard/wg0.conf
 wg-quick strip wg0 >/dev/null
 
 phase="forwarding/NAT/sysctl"
+command_category="forwarding-nat-sysctl"
 echo "ephemeral-vpn bootstrap phase: ${phase}"
 cat > /etc/sysctl.d/99-wireguard.conf <<'SYSCTL_CONFIG'
 net.ipv4.ip_forward=1
@@ -113,10 +146,12 @@ OUTBOUND_IFACE="$(ip route show default | awk '/default/ {print $5; exit}')"
 test -n "${OUTBOUND_IFACE}"
 
 phase="WireGuard service enable/start"
+command_category="wireguard-service-start"
 echo "ephemeral-vpn bootstrap phase: ${phase}"
 systemctl enable --now wg-quick@wg0
 
 phase="final readiness validation"
+command_category="final-readiness-validation"
 echo "ephemeral-vpn bootstrap phase: ${phase}"
 systemctl is-enabled --quiet wg-quick@wg0
 systemctl is-active --quiet wg-quick@wg0

@@ -1,11 +1,15 @@
 locals {
-  vpn_name = "ephemeral-vpn-lightsail-${substr(var.deployment_id, 0, 8)}"
-  bootstrap_script = replace(replace(replace(
-    file("${path.module}/../terraform-common/bootstrap.sh.tftpl"),
+  vpn_name         = "ephemeral-vpn-lightsail-${substr(var.deployment_id, 0, 8)}"
+  bootstrap_source = file("${path.module}/../terraform-common/bootstrap.sh.tftpl")
+  bootstrap_script = replace(replace(replace(replace(
+    local.bootstrap_source,
     "@@WIREGUARD_PORT@@", tostring(var.wireguard_port)),
     "@@SERVER_PRIVATE_KEY@@", var.server_private_key),
-  "@@CLIENT_PUBLIC_KEY@@", var.client_public_key)
-  user_data = var.user_data_payload != null ? var.user_data_payload : local.bootstrap_script
+    "@@CLIENT_PUBLIC_KEY@@", var.client_public_key),
+  "@@BOOTSTRAP_FINGERPRINT@@", substr(sha256(local.bootstrap_source), 0, 12))
+  lightsail_bash_trampoline = "#!/bin/sh\n# Lightsail prepends a POSIX-shell initialization script. Enter Bash explicitly.\nexec /usr/bin/env bash -s -- <<'EPHEMERAL_VPN_BOOTSTRAP'\n"
+  lightsail_fallback        = "${local.lightsail_bash_trampoline}${local.bootstrap_script}EPHEMERAL_VPN_BOOTSTRAP\n"
+  user_data                 = var.user_data_payload != null ? var.user_data_payload : local.lightsail_fallback
 }
 resource "aws_lightsail_key_pair" "vpn" {
   count      = var.ssh_public_key == null ? 0 : 1

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterator
 
 from catalog import ProviderCatalog
-from cloud_init import render_user_data
+from cloud_init import FAILURE_MARKER, bootstrap_source_sha256, render_user_data
 from file_lock import FileLock
 from legacy_reconciliation import LegacyReconciliationStore
 from models import DeploymentOptions, DeploymentRecord, DeploymentState, StatusEvent, now_iso
@@ -44,6 +44,7 @@ IpDetector = Callable[[], str]
 LEGACY_STATE_NAMES = ("terraform.tfstate", "terraform.tfstate.backup")
 TERRAFORM_WORK_ROOT = "terraform-work"
 TERRAFORM_WORK_MANIFEST = "terraform-work-manifest.json"
+USER_DATA_MANIFEST = "user-data-manifest.json"
 PROVIDER_RESOURCE_PREFIXES = {
     "aws-lightsail": "aws_lightsail_",
     "digitalocean": "digitalocean_",
@@ -272,6 +273,7 @@ class Orchestrator:
                     server_private_key=server_private,
                     client_public_key=client_public,
                 )
+                self._write_user_data_manifest(record, staged_common, user_data_payload)
                 variables = provider.terraform_variables(location, effective_options)
                 variables.update(
                     {
@@ -430,11 +432,27 @@ class Orchestrator:
                     combined = (stdout + "\n" + stderr).strip()
                     status = self._cloud_init_status(returncode, combined)
                     if status == "error":
-                        diagnostic = self._cloud_init_failure_diagnostic(combined)
-                        detail = f" Failed phase: {diagnostic}." if diagnostic else ""
+                        failure_args = self._ssh_command(
+                            identity,
+                            known_hosts,
+                            user,
+                            record.public_ip,
+                            f"if [ -r {FAILURE_MARKER} ]; then cat {FAILURE_MARKER}; fi",
+                        )
+                        _failure_code, failure_stdout, failure_stderr = self._run_cancellable_process(
+                            failure_args, cancel, timeout=20
+                        )
+                        diagnostic = self._cloud_init_failure_diagnostic(
+                            "\n".join((combined, failure_stdout, failure_stderr))
+                        )
+                        if diagnostic:
+                            raise TerraformError(
+                                f"Cloud initialization failed during {diagnostic}. "
+                                "Cloud resources may exist and must be destroyed."
+                            )
                         raise TerraformError(
                             "Cloud initialization failed during bootstrap. "
-                            f"Cloud resources may exist and must be destroyed.{detail}"
+                            "Cloud resources may exist and must be destroyed."
                         )
                     if status != "done":
                         last_error = "Cloud initialization is still running"
@@ -505,6 +523,19 @@ class Orchestrator:
 
     @staticmethod
     def _cloud_init_failure_diagnostic(output: str) -> str | None:
+        detailed = re.search(
+            r"ephemeral-vpn bootstrap failure: "
+            r"phase=([A-Za-z0-9 /_-]{1,80}) "
+            r"category=([a-z0-9-]{1,64}) "
+            r"exit=([0-9]{1,3}) "
+            r"line=([0-9]{1,5}) "
+            r"build=([0-9a-f]{12})",
+            output,
+            flags=re.IGNORECASE,
+        )
+        if detailed:
+            phase, category, exit_status, line, build = detailed.groups()
+            return f"{phase.strip()} ({category.lower()}, exit {exit_status}, line {line}, build {build.lower()})"
         match = re.search(
             r"ephemeral-vpn bootstrap failed in phase ([A-Za-z0-9 /_-]{1,80})", output, flags=re.IGNORECASE
         )
@@ -1311,6 +1342,40 @@ class Orchestrator:
             shutil.rmtree(work_root, ignore_errors=True)
             manifest_path.unlink(missing_ok=True)
             raise
+
+    def _write_user_data_manifest(self, record: DeploymentRecord, common_root: Path, payload: str) -> None:
+        """Persist non-secret proof of the exact staged source and Terraform payload."""
+        runtime = Path(record.runtime_directory).resolve()
+        self._assert_scoped_path(runtime, Path(record.state_path).resolve())
+        manifest_path = (runtime / USER_DATA_MANIFEST).resolve()
+        if manifest_path.parent != runtime or manifest_path.exists():
+            raise TerraformError("Deployment user-data manifest already exists or is unsafe")
+        self._verify_terraform_work_manifest(record)
+        source_sha256 = bootstrap_source_sha256(common_root)
+        build = source_sha256[:12]
+        if f"BOOTSTRAP_BUILD={build}" not in payload:
+            raise TerraformError("Rendered user-data does not match the staged bootstrap source")
+        payload_bytes = payload.encode("utf-8")
+        manifest = {
+            "version": 1,
+            "provider_id": record.provider_id,
+            "bootstrap_source_sha256": source_sha256,
+            "bootstrap_build": build,
+            "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+            "payload_byte_length": len(payload_bytes),
+            "transport": (
+                "lightsail-posix-to-bash-trampoline"
+                if record.provider_id == "aws-lightsail"
+                else "cloud-config-shared-bootstrap"
+            ),
+            "created_at": now_iso(),
+        }
+        temporary = manifest_path.with_suffix(".tmp")
+        write_secret(temporary, json.dumps(manifest, indent=2, sort_keys=True))
+        temporary.replace(manifest_path)
+        persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if persisted != manifest:
+            raise TerraformError("Deployment user-data manifest verification failed")
 
     def _verify_terraform_work_manifest(self, record: DeploymentRecord) -> None:
         runtime = Path(record.runtime_directory).resolve()

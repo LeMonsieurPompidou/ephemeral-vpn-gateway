@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,13 @@ SHELL_SCRIPT_PROVIDERS = frozenset({"aws-lightsail"})
 SUPPORTED_PROVIDERS = CLOUD_CONFIG_PROVIDERS | SHELL_SCRIPT_PROVIDERS
 BOOTSTRAP_PATH = "/usr/local/sbin/ephemeral-vpn-bootstrap"
 READINESS_MARKER = "/var/lib/ephemeral-vpn/ready"
+FAILURE_MARKER = "/var/lib/ephemeral-vpn/bootstrap-failure"
+LIGHTSAIL_BOOTSTRAP_BOUNDARY = "EPHEMERAL_VPN_BOOTSTRAP"
+LIGHTSAIL_BASH_TRAMPOLINE = (
+    "#!/bin/sh\n"
+    "# Lightsail prepends a POSIX-shell initialization script. Enter Bash explicitly.\n"
+    f"exec /usr/bin/env bash -s -- <<'{LIGHTSAIL_BOOTSTRAP_BOUNDARY}'\n"
+)
 
 
 class UserDataValidationError(RuntimeError):
@@ -42,6 +50,12 @@ def _wireguard_key(value: str, name: str) -> str:
     return value
 
 
+def bootstrap_source_sha256(common_root: Path) -> str:
+    """Fingerprint the normalized, secret-free shared bootstrap source."""
+    template = _read_template(common_root / "bootstrap.sh.tftpl")
+    return hashlib.sha256(template.encode("utf-8")).hexdigest()
+
+
 def render_user_data(
     provider_id: str,
     common_root: Path,
@@ -55,10 +69,12 @@ def render_user_data(
         raise UserDataValidationError("Unsupported user-data provider")
     if not 1 <= wireguard_port <= 65535:
         raise UserDataValidationError("WireGuard port is outside the valid range")
+    source_sha256 = bootstrap_source_sha256(common_root)
     replacements = {
         "@@WIREGUARD_PORT@@": str(wireguard_port),
         "@@SERVER_PRIVATE_KEY@@": _wireguard_key(server_private_key, "Server WireGuard key"),
         "@@CLIENT_PUBLIC_KEY@@": _wireguard_key(client_public_key, "Client WireGuard key"),
+        "@@BOOTSTRAP_FINGERPRINT@@": source_sha256[:12],
     }
     bootstrap = _read_template(common_root / "bootstrap.sh.tftpl")
     for token, value in replacements.items():
@@ -68,7 +84,7 @@ def render_user_data(
     bootstrap = bootstrap.rstrip("\n") + "\n"
 
     if provider_id in SHELL_SCRIPT_PROVIDERS:
-        payload = bootstrap
+        payload = LIGHTSAIL_BASH_TRAMPOLINE + bootstrap + LIGHTSAIL_BOOTSTRAP_BOUNDARY + "\n"
     else:
         cloud_config = _read_template(common_root / "cloud-init.yaml.tftpl")
         if cloud_config.count("@@BOOTSTRAP_SCRIPT@@") != 1:
@@ -91,11 +107,11 @@ def validate_user_data_payload(provider_id: str, payload: str) -> None:
         raise UserDataValidationError("Rendered user-data is empty")
 
     if provider_id in SHELL_SCRIPT_PROVIDERS:
-        if meaningful[0] != "#!/usr/bin/env bash" or "#cloud-config" in meaningful:
-            raise UserDataValidationError("Lightsail user-data must be an explicit Bash launch script")
+        if meaningful[0] != "#!/bin/sh" or "#cloud-config" in meaningful:
+            raise UserDataValidationError("Lightsail user-data must use the POSIX-to-Bash launch trampoline")
         if re.search(r"(?m)^(?:package_update|packages|write_files|runcmd):", payload):
             raise UserDataValidationError("Lightsail launch script contains cloud-config YAML directives")
-        bootstrap = payload
+        bootstrap = _bootstrap_from_lightsail(payload)
     else:
         if meaningful[0] != "#cloud-config":
             raise UserDataValidationError("Cloud-config header must be the first meaningful line")
@@ -117,6 +133,20 @@ def validate_user_data_payload(provider_id: str, payload: str) -> None:
     _validate_bootstrap(bootstrap)
 
 
+def _bootstrap_from_lightsail(payload: str) -> str:
+    suffix = LIGHTSAIL_BOOTSTRAP_BOUNDARY + "\n"
+    if (
+        not payload.startswith(LIGHTSAIL_BASH_TRAMPOLINE)
+        or not payload.endswith(suffix)
+        or payload.count(LIGHTSAIL_BOOTSTRAP_BOUNDARY) != 2
+    ):
+        raise UserDataValidationError("Lightsail user-data has an invalid Bash trampoline")
+    bootstrap = payload[len(LIGHTSAIL_BASH_TRAMPOLINE) : -len(suffix)]
+    if not bootstrap.endswith("\n"):
+        raise UserDataValidationError("Lightsail bootstrap must end with a newline")
+    return bootstrap
+
+
 def _bootstrap_from_cloud_config(document: dict[str, Any]) -> str:
     files = document.get("write_files")
     if not isinstance(files, list):
@@ -135,6 +165,9 @@ def _validate_bootstrap(bootstrap: str) -> None:
     if "$$" in bootstrap:
         raise UserDataValidationError("Bootstrap script contains PID-style dollar expansion")
     required = (
+        "BOOTSTRAP_BUILD=",
+        "ephemeral-vpn bootstrap build: ${BOOTSTRAP_BUILD}",
+        "ephemeral-vpn bootstrap failure: phase=${phase} category=${command_category}",
         "NEEDRESTART_SUSPEND=1 apt-get install -y iptables wireguard",
         "ephemeral-vpn bootstrap: automatic needrestart hook suspended for prerequisite installation",
         "ephemeral-vpn bootstrap: package installation completed",
@@ -162,6 +195,8 @@ def _validate_bootstrap(bootstrap: str) -> None:
     )
     if not all(value in bootstrap for value in required):
         raise UserDataValidationError("Bootstrap script is missing a required provisioning invariant")
+    if not re.search(r"(?m)^BOOTSTRAP_BUILD=[0-9a-f]{12}$", bootstrap):
+        raise UserDataValidationError("Bootstrap script has an invalid source fingerprint")
     if "NEEDRESTART_MODE=" in bootstrap:
         raise UserDataValidationError("Bootstrap script must suspend rather than configure the needrestart APT hook")
     if "systemctl cat" in bootstrap:

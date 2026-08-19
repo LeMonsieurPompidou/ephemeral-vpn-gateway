@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -8,7 +9,14 @@ from pathlib import Path
 import orchestrator as orchestrator_module
 import pytest
 import yaml
-from cloud_init import UserDataValidationError, render_user_data, validate_user_data_payload
+from cloud_init import (
+    LIGHTSAIL_BASH_TRAMPOLINE,
+    LIGHTSAIL_BOOTSTRAP_BOUNDARY,
+    UserDataValidationError,
+    bootstrap_source_sha256,
+    render_user_data,
+    validate_user_data_payload,
+)
 from helpers import FakeTerraformRunner, make_orchestrator
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +37,9 @@ def rendered(provider_id: str) -> str:
 
 def bootstrap_from_payload(provider_id: str, payload: str) -> str:
     if provider_id == "aws-lightsail":
-        return payload
+        assert payload.startswith(LIGHTSAIL_BASH_TRAMPOLINE)
+        assert payload.endswith(LIGHTSAIL_BOOTSTRAP_BOUNDARY + "\n")
+        return payload[len(LIGHTSAIL_BASH_TRAMPOLINE) : -len(LIGHTSAIL_BOOTSTRAP_BOUNDARY + "\n")]
     document = yaml.safe_load(payload)
     return next(item["content"] for item in document["write_files"] if item["path"].endswith("bootstrap"))
 
@@ -81,7 +91,10 @@ def simulate_prerequisite_phase(
 
 def test_aws_lightsail_receives_an_explicit_shell_launch_script() -> None:
     payload = rendered("aws-lightsail")
-    assert payload.encode("utf-8").startswith(b"#!/usr/bin/env bash\nset -Eeuo pipefail\n")
+    bootstrap = bootstrap_from_payload("aws-lightsail", payload)
+    assert payload.encode("utf-8").startswith(b"#!/bin/sh\n")
+    assert "exec /usr/bin/env bash -s -- <<'EPHEMERAL_VPN_BOOTSTRAP'\n" in payload
+    assert bootstrap.encode("utf-8").startswith(b"#!/usr/bin/env bash\nset -Eeuo pipefail\n")
     assert "#cloud-config" not in payload
     assert "\npackage_update:" not in payload
     assert "\nwrite_files:" not in payload
@@ -162,7 +175,18 @@ def test_real_package_failure_remains_fatal_before_ssh_and_readiness() -> None:
     assert "apt-get update failed (exit ${package_status})" in bootstrap
     assert "package installation failed (apt-get exit ${package_status})" in bootstrap
     assert "inspect preceding apt/dpkg output" in bootstrap
-    assert 'exit "${package_status}"' in bootstrap
+    assert 'record_bootstrap_failure "${package_status}" "${LINENO}"' in bootstrap
+
+
+def test_lightsail_provider_prefix_cannot_force_shared_bootstrap_to_run_under_dash() -> None:
+    payload = rendered("aws-lightsail")
+    provider_prefix = "#!/bin/sh\nservice sshd restart\necho provider-prefix-complete\n"
+    executed = provider_prefix + payload
+    assert executed.startswith("#!/bin/sh\n")
+    trampoline = executed.index("exec /usr/bin/env bash -s --")
+    strict_mode = executed.index("set -Eeuo pipefail")
+    assert trampoline < strict_mode
+    assert executed.count("exec /usr/bin/env bash -s --") == 1
 
 
 def test_rendered_phase_boundaries_precede_wireguard_and_readiness() -> None:
@@ -278,7 +302,7 @@ def test_lightsail_validation_rejects_cloud_config_directives_inside_launch_scri
 @pytest.mark.parametrize(
     ("provider_id", "location_id", "expected_prefix"),
     [
-        ("aws-lightsail", "us-east-1", "#!/usr/bin/env bash\n"),
+        ("aws-lightsail", "us-east-1", "#!/bin/sh\n"),
         ("digitalocean", "nyc3", "#cloud-config\n"),
         ("scaleway", "fr-par-1", "#cloud-config\n"),
     ],
@@ -295,6 +319,15 @@ def test_orchestrator_passes_the_validated_rendered_payload_to_terraform(
     assert isinstance(payload, str)
     assert payload.startswith(expected_prefix)
     validate_user_data_payload(provider_id, payload)
+    manifest = json.loads(Path(record.runtime_directory, "user-data-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["payload_sha256"] == hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    assert manifest["payload_byte_length"] == len(payload.encode("utf-8"))
+    assert manifest["bootstrap_source_sha256"] == bootstrap_source_sha256(
+        Path(record.runtime_directory, "terraform-work", "terraform-common")
+    )
+    assert f"BOOTSTRAP_BUILD={manifest['bootstrap_build']}" in payload
+    assert SERVER_PRIVATE not in json.dumps(manifest)
+    assert CLIENT_PUBLIC not in json.dumps(manifest)
     assert any(call[0][0] == "plan" for call in runner.calls)
     assert all(call[0][0] != "apply" for call in runner.calls)
 
@@ -321,8 +354,38 @@ def test_every_terraform_provider_uses_the_backend_validated_payload_directly() 
         variables = (ROOT / provider / "variables.tf").read_text(encoding="utf-8")
         assert "var.user_data_payload != null ? var.user_data_payload" in main
         assert 'variable "user_data_payload"' in variables
-    assert "user_data         = local.user_data" in (ROOT / "vpn-aws-lightsail" / "main.tf").read_text(encoding="utf-8")
+        assert '"@@BOOTSTRAP_FINGERPRINT@@", substr(sha256(local.bootstrap_source), 0, 12)' in main
+    aws_main = (ROOT / "vpn-aws-lightsail" / "main.tf").read_text(encoding="utf-8")
+    assert "exec /usr/bin/env bash -s -- <<'EPHEMERAL_VPN_BOOTSTRAP'" in aws_main
+    assert "local.lightsail_fallback" in aws_main
+    assert "user_data         = local.user_data" in aws_main
     assert "user_data = local.user_data" in (ROOT / "vpn-digitalocean" / "main.tf").read_text(encoding="utf-8")
     assert "user_data  = { cloud-init = local.user_data }" in (ROOT / "vpn-scaleway" / "main.tf").read_text(
         encoding="utf-8"
     )
+
+
+def test_fresh_deployment_stages_current_bootstrap_and_never_reuses_old_user_data(tmp_path: Path) -> None:
+    orchestrator = make_orchestrator(tmp_path, FakeTerraformRunner())
+    first = orchestrator.plan("aws-lightsail", "us-east-1")
+    first_record = orchestrator.deployments.get(str(first["deployment_id"]))
+    first_manifest = json.loads(
+        Path(first_record.runtime_directory, "user-data-manifest.json").read_text(encoding="utf-8")
+    )
+    first_record.state = orchestrator_module.DeploymentState.DESTROYED
+    first_record.resources_possible = False
+    first_record.state_present = False
+    orchestrator.deployments.save(first_record)
+
+    source = orchestrator.resource_root / "terraform-common" / "bootstrap.sh.tftpl"
+    source.write_text(source.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    second = orchestrator.plan("aws-lightsail", "us-east-1")
+    second_record = orchestrator.deployments.get(str(second["deployment_id"]))
+    second_manifest = json.loads(
+        Path(second_record.runtime_directory, "user-data-manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert first_record.runtime_directory != second_record.runtime_directory
+    assert first_manifest["bootstrap_source_sha256"] != second_manifest["bootstrap_source_sha256"]
+    assert first_manifest["bootstrap_build"] != second_manifest["bootstrap_build"]
+    assert first_manifest["payload_sha256"] != second_manifest["payload_sha256"]

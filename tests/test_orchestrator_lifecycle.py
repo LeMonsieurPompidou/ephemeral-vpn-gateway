@@ -31,7 +31,7 @@ def test_state_backend_is_deployment_scoped(tmp_path: Path, provider_id: str, lo
     assert "ssh_private_key" not in variables
     assert "client_private_key" not in variables
     if provider_id == "aws-lightsail":
-        assert variables["user_data_payload"].startswith("#!/usr/bin/env bash\n")
+        assert variables["user_data_payload"].startswith("#!/bin/sh\n")
     else:
         assert variables["user_data_payload"].startswith("#cloud-config\n")
     destroy = orchestrator.destroy(record.id)
