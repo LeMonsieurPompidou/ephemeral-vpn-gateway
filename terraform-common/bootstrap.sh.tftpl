@@ -3,16 +3,34 @@ set -Eeuo pipefail
 umask 077
 
 READY_MARKER=/var/lib/ephemeral-vpn/ready
-phase="prerequisite/package setup"
+phase="prerequisite installation"
 trap 'code=$?; echo "ephemeral-vpn bootstrap failed in phase ${phase} (exit ${code})" >&2; exit "${code}"' ERR
 echo "ephemeral-vpn bootstrap phase: ${phase}"
 rm -f "${READY_MARKER}"
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v wg >/dev/null || ! command -v wg-quick >/dev/null || ! command -v iptables >/dev/null; then
-  apt-get update
-  # Package hooks must not restart services using daemon-derived names such as
-  # sshd.service. SSH is validated and restarted explicitly below.
-  NEEDRESTART_MODE=l apt-get install -y iptables wireguard
+  echo "ephemeral-vpn bootstrap: refreshing package indexes"
+  if apt-get update; then
+    echo "ephemeral-vpn bootstrap: package indexes refreshed"
+  else
+    package_status=$?
+    echo "ephemeral-vpn bootstrap: apt-get update failed (exit ${package_status})" >&2
+    exit "${package_status}"
+  fi
+
+  # Ubuntu Noble's APT hook runs needrestart in automatic mode. Suspend that
+  # scanner for this transaction; SSH is validated and restarted explicitly
+  # in the controlled phase below. Other APT/dpkg failures remain fatal.
+  echo "ephemeral-vpn bootstrap: automatic needrestart hook suspended for prerequisite installation"
+  if NEEDRESTART_SUSPEND=1 apt-get install -y iptables wireguard; then
+    echo "ephemeral-vpn bootstrap: package installation completed"
+  else
+    package_status=$?
+    echo "ephemeral-vpn bootstrap: package installation failed (apt-get exit ${package_status}); inspect preceding apt/dpkg output" >&2
+    exit "${package_status}"
+  fi
+else
+  echo "ephemeral-vpn bootstrap: prerequisite packages already present"
 fi
 command -v systemctl >/dev/null
 command -v iptables >/dev/null

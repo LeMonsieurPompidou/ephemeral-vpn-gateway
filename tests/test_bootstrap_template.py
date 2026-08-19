@@ -63,6 +63,22 @@ def simulate_ssh_phase(
     return selected, restarts, probes, ssh_ready, ssh_ready
 
 
+def simulate_prerequisite_phase(
+    bootstrap: str,
+    *,
+    apt_status: int,
+    needrestart_present: bool,
+    needrestart_would_restart_sshd: bool,
+) -> tuple[bool, bool, bool]:
+    """Model the APT hook boundary declared by the final rendered script."""
+    hook_suspended = "NEEDRESTART_SUSPEND=1 apt-get install -y iptables wireguard" in bootstrap
+    hidden_restart_attempted = needrestart_present and needrestart_would_restart_sshd and not hook_suspended
+    package_succeeded = apt_status == 0 and not hidden_restart_attempted
+    ssh_phase_entered = package_succeeded
+    readiness_marker_created = False
+    return hidden_restart_attempted, ssh_phase_entered, readiness_marker_created
+
+
 def test_aws_lightsail_receives_an_explicit_shell_launch_script() -> None:
     payload = rendered("aws-lightsail")
     assert payload.encode("utf-8").startswith(b"#!/usr/bin/env bash\nset -Eeuo pipefail\n")
@@ -75,9 +91,11 @@ def test_aws_lightsail_receives_an_explicit_shell_launch_script() -> None:
 @pytest.mark.parametrize("provider_id", ["digitalocean", "scaleway"])
 def test_cloud_config_providers_receive_valid_yaml_with_bootstrap(provider_id: str) -> None:
     payload = rendered(provider_id)
-    assert payload.encode("utf-8").startswith(b"#cloud-config\npackage_update: true\n")
+    assert payload.encode("utf-8").startswith(b"#cloud-config\nwrite_files:\n")
     document = yaml.safe_load(payload)
-    assert set(("packages", "write_files", "runcmd")).issubset(document)
+    assert set(("write_files", "runcmd")).issubset(document)
+    assert "packages" not in document
+    assert "package_update" not in document
     script = next(item["content"] for item in document["write_files"] if item["path"].endswith("bootstrap"))
     assert script.startswith("#!/usr/bin/env bash\n")
     assert document["runcmd"] == [["/usr/local/sbin/ephemeral-vpn-bootstrap"]]
@@ -92,7 +110,8 @@ def test_final_payload_has_literal_shell_expansion_and_complete_wireguard_bootst
     assert "systemctl daemon-reload" in payload
     assert 'systemctl show --property=LoadState --value "${candidate}"' in payload
     assert "systemctl cat" not in payload
-    assert "NEEDRESTART_MODE=l apt-get install -y iptables wireguard" in payload
+    assert "NEEDRESTART_SUSPEND=1 apt-get install -y iptables wireguard" in payload
+    assert "NEEDRESTART_MODE=" not in payload
     assert "$$" not in payload
     assert "$${ssh_service}" not in payload
     assert "@@" not in payload
@@ -111,6 +130,53 @@ def test_final_payload_has_literal_shell_expansion_and_complete_wireguard_bootst
     ):
         assert required in payload
     assert payload.index("systemctl is-active --quiet wg-quick@wg0") < payload.index('touch "${READY_MARKER}"')
+
+
+@pytest.mark.parametrize("provider_id", ["aws-lightsail", "digitalocean", "scaleway"])
+def test_needrestart_hook_is_suspended_at_the_shared_package_boundary(provider_id: str) -> None:
+    bootstrap = bootstrap_from_payload(provider_id, rendered(provider_id))
+    hidden_restart, ssh_entered, marker_created = simulate_prerequisite_phase(
+        bootstrap,
+        apt_status=0,
+        needrestart_present=True,
+        needrestart_would_restart_sshd=True,
+    )
+    assert not hidden_restart
+    assert ssh_entered
+    assert not marker_created
+    assert "ephemeral-vpn bootstrap: package installation completed" in bootstrap
+    assert bootstrap.index('phase="prerequisite installation"') < bootstrap.index('phase="SSH hardening/configuration"')
+
+
+def test_real_package_failure_remains_fatal_before_ssh_and_readiness() -> None:
+    bootstrap = bootstrap_from_payload("aws-lightsail", rendered("aws-lightsail"))
+    hidden_restart, ssh_entered, marker_created = simulate_prerequisite_phase(
+        bootstrap,
+        apt_status=100,
+        needrestart_present=True,
+        needrestart_would_restart_sshd=False,
+    )
+    assert not hidden_restart
+    assert not ssh_entered
+    assert not marker_created
+    assert "apt-get update failed (exit ${package_status})" in bootstrap
+    assert "package installation failed (apt-get exit ${package_status})" in bootstrap
+    assert "inspect preceding apt/dpkg output" in bootstrap
+    assert 'exit "${package_status}"' in bootstrap
+
+
+def test_rendered_phase_boundaries_precede_wireguard_and_readiness() -> None:
+    bootstrap = bootstrap_from_payload("aws-lightsail", rendered("aws-lightsail"))
+    ordered = (
+        'phase="prerequisite installation"',
+        "NEEDRESTART_SUSPEND=1 apt-get install -y iptables wireguard",
+        'phase="SSH hardening/configuration"',
+        'systemctl restart "${ssh_service}"',
+        'phase="WireGuard configuration"',
+        'touch "${READY_MARKER}"',
+    )
+    offsets = [bootstrap.index(item) for item in ordered]
+    assert offsets == sorted(offsets)
 
 
 @pytest.mark.parametrize(
@@ -194,6 +260,12 @@ def test_rendered_payload_has_one_portable_ssh_resolution_path(provider_id: str)
 )
 def test_cloud_config_validation_rejects_mixed_malformed_or_incomplete_payload(payload: str) -> None:
     with pytest.raises(UserDataValidationError):
+        validate_user_data_payload("digitalocean", payload)
+
+
+def test_cloud_config_rejects_package_installation_outside_shared_bootstrap() -> None:
+    payload = rendered("digitalocean").replace("#cloud-config\n", "#cloud-config\npackages: [wireguard]\n", 1)
+    with pytest.raises(UserDataValidationError, match="delegate package installation"):
         validate_user_data_payload("digitalocean", payload)
 
 

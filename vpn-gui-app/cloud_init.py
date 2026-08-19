@@ -107,9 +107,11 @@ def validate_user_data_payload(provider_id: str, payload: str) -> None:
             raise UserDataValidationError("Rendered cloud-config is not valid YAML") from exc
         if not isinstance(document, dict):
             raise UserDataValidationError("Rendered cloud-config must be a YAML mapping")
-        required = {"packages", "write_files", "runcmd"}
+        required = {"write_files", "runcmd"}
         if not required.issubset(document):
             raise UserDataValidationError("Rendered cloud-config is missing required top-level keys")
+        if any(key in document for key in ("package_update", "package_upgrade", "packages")):
+            raise UserDataValidationError("Rendered cloud-config must delegate package installation to the bootstrap")
         bootstrap = _bootstrap_from_cloud_config(document)
 
     _validate_bootstrap(bootstrap)
@@ -133,7 +135,10 @@ def _validate_bootstrap(bootstrap: str) -> None:
     if "$$" in bootstrap:
         raise UserDataValidationError("Bootstrap script contains PID-style dollar expansion")
     required = (
-        "NEEDRESTART_MODE=l apt-get install -y iptables wireguard",
+        "NEEDRESTART_SUSPEND=1 apt-get install -y iptables wireguard",
+        "ephemeral-vpn bootstrap: automatic needrestart hook suspended for prerequisite installation",
+        "ephemeral-vpn bootstrap: package installation completed",
+        "ephemeral-vpn bootstrap: package installation failed (apt-get exit ${package_status})",
         "systemctl daemon-reload",
         "resolve_ssh_service() {",
         "for attempt in 1 2 3 4 5; do",
@@ -157,6 +162,8 @@ def _validate_bootstrap(bootstrap: str) -> None:
     )
     if not all(value in bootstrap for value in required):
         raise UserDataValidationError("Bootstrap script is missing a required provisioning invariant")
+    if "NEEDRESTART_MODE=" in bootstrap:
+        raise UserDataValidationError("Bootstrap script must suspend rather than configure the needrestart APT hook")
     if "systemctl cat" in bootstrap:
         raise UserDataValidationError("Bootstrap script uses nondeterministic unit-file probing")
     if re.search(r"systemctl\s+restart\s+['\"]?(?:ssh|sshd)\.service", bootstrap):
@@ -164,7 +171,7 @@ def _validate_bootstrap(bootstrap: str) -> None:
     if bootstrap.count('systemctl restart "${ssh_service}"') != 1:
         raise UserDataValidationError("Bootstrap script must contain exactly one resolved OpenSSH restart")
     phases = (
-        'phase="prerequisite/package setup"',
+        'phase="prerequisite installation"',
         'phase="SSH hardening/configuration"',
         'phase="WireGuard configuration"',
         'phase="forwarding/NAT/sysctl"',
@@ -176,7 +183,7 @@ def _validate_bootstrap(bootstrap: str) -> None:
         raise UserDataValidationError("Bootstrap provisioning phases are out of order")
     marker = bootstrap.index('touch "${READY_MARKER}"')
     prerequisites = (
-        bootstrap.index("NEEDRESTART_MODE=l apt-get install -y iptables wireguard"),
+        bootstrap.index("NEEDRESTART_SUSPEND=1 apt-get install -y iptables wireguard"),
         bootstrap.index('systemctl restart "${ssh_service}"'),
         bootstrap.index("wg-quick strip wg0"),
         bootstrap.index("sysctl --system"),
