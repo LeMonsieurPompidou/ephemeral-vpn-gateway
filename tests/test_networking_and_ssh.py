@@ -28,6 +28,47 @@ class Response:
         return self.body[:maximum]
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class AdvancingEvent:
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+
+    def is_set(self) -> bool:
+        return False
+
+    def wait(self, timeout: float) -> bool:
+        self.clock.advance(timeout)
+        return False
+
+
+class CloudSequence:
+    def __init__(self, statuses: list[str], progress: list[str]) -> None:
+        self.statuses = statuses
+        self.progress = progress
+        self.poll = 0
+
+    def __call__(self, args, cancel, *, timeout):  # type: ignore[no-untyped-def]
+        command = args[-1]
+        if command == "cloud-init status --long":
+            status = self.statuses[min(self.poll, len(self.statuses) - 1)]
+            return (2 if status == "error" else 0), f"status: {status}", ""
+        if command == orchestrator_module.CLOUD_INIT_PROGRESS_COMMAND:
+            value = self.progress[min(self.poll, len(self.progress) - 1)]
+            self.poll += 1
+            return 0, value, ""
+        raise AssertionError(f"Unexpected SSH command: {command}")
+
+
 def test_public_ipv4_detection_and_normalization(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr(networking.urllib.request, "urlopen", lambda request, timeout: Response(b"8.8.8.8\n"))
     assert detect_public_ipv4() == "8.8.8.8/32"
@@ -170,7 +211,10 @@ def test_cloud_init_error_fails_immediately_with_sanitized_phase(tmp_path: Path,
     def run(*args, **kwargs):  # type: ignore[no-untyped-def]
         nonlocal calls
         calls += 1
-        if calls == 1:
+        command = args[0][-1]
+        if command == "true":
+            return 0, "", ""
+        if command == "cloud-init status --long":
             return 2, "status: error", ""
         return 0, "ephemeral-vpn bootstrap failed in phase SSH hardening/configuration", ""
 
@@ -184,7 +228,7 @@ def test_cloud_init_error_fails_immediately_with_sanitized_phase(tmp_path: Path,
             threading.Event(),
             automatic_ssh_cidr=False,
         )
-    assert calls == 2
+    assert calls == 3
 
 
 @pytest.mark.parametrize(
@@ -212,6 +256,7 @@ def test_cloud_init_error_uses_persisted_safe_failure_diagnostic(
 
     outputs = iter(
         [
+            (0, "", ""),
             (2, "status: error", ""),
             (
                 0,
@@ -238,6 +283,192 @@ def test_cloud_init_error_uses_persisted_safe_failure_diagnostic(
     assert "exit 1" in message
     assert "build 0123456789ab" in message
     assert "must-not-appear" not in message
+
+
+def _progress(phase: str, activity: int, *, ready: bool = False) -> str:
+    return (
+        f"phase={phase}\nbuild=0123456789ab\nactivity_epoch={activity}\nactivity_size={activity}\nready={int(ready)}\n"
+    )
+
+
+def test_cloud_init_can_progress_beyond_old_timeout_and_finish(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    clock = FakeClock()
+    event = AdvancingEvent(clock)
+    orchestrator.cloud_init_hard_timeout = 900
+    orchestrator.cloud_init_inactivity_timeout = 180
+    orchestrator.readiness_poll_interval = 60
+    sequence = CloudSequence(
+        ["running"] * 6 + ["done"],
+        [_progress("prerequisite installation", index) for index in range(1, 8)],
+    )
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock)
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", sequence)
+
+    orchestrator._wait_for_cloud_init(
+        record,
+        Path("identity"),
+        Path("known-hosts"),
+        "ubuntu",
+        event,  # type: ignore[arg-type]
+        overall_started=0,
+    )
+
+    assert clock.value == 360
+    persisted = orchestrator.deployments.get(record.id)
+    assert persisted.bootstrap_phase == "prerequisite installation"
+    assert persisted.provisioning_elapsed_seconds == 360
+    logs = Path(record.runtime_directory, "deployment.log").read_text(encoding="utf-8")
+    assert "Cloud init still active during prerequisite installation" in logs
+    assert "elapsed 5m00s" in logs
+    assert "Cloud init completed (6m00s)" in logs
+
+
+def test_cloud_init_running_without_progress_stalls(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    clock = FakeClock()
+    event = AdvancingEvent(clock)
+    orchestrator.cloud_init_hard_timeout = 60
+    orchestrator.cloud_init_inactivity_timeout = 10
+    orchestrator.readiness_poll_interval = 5
+    sequence = CloudSequence(["running"], [_progress("prerequisite installation", 1)])
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock)
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", sequence)
+
+    with pytest.raises(TerraformError, match="stalled during prerequisite installation.*10s"):
+        orchestrator._wait_for_cloud_init(
+            record,
+            Path("identity"),
+            Path("known-hosts"),
+            "ubuntu",
+            event,  # type: ignore[arg-type]
+            overall_started=0,
+        )
+
+
+def test_cloud_init_phase_change_resets_inactivity_deadline(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    clock = FakeClock()
+    event = AdvancingEvent(clock)
+    orchestrator.cloud_init_hard_timeout = 30
+    orchestrator.cloud_init_inactivity_timeout = 10
+    orchestrator.readiness_poll_interval = 5
+    sequence = CloudSequence(
+        ["running", "running", "running", "done"],
+        [
+            _progress("prerequisite installation", 1),
+            _progress("prerequisite installation", 1),
+            _progress("SSH hardening/configuration", 2),
+            _progress("final readiness validation", 3, ready=True),
+        ],
+    )
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock)
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", sequence)
+
+    orchestrator._wait_for_cloud_init(
+        record,
+        Path("identity"),
+        Path("known-hosts"),
+        "ubuntu",
+        event,  # type: ignore[arg-type]
+        overall_started=0,
+    )
+    assert record.bootstrap_phase == "final readiness validation"
+
+
+def test_cloud_init_finishing_immediately_before_hard_deadline_succeeds(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    clock = FakeClock()
+    event = AdvancingEvent(clock)
+    orchestrator.cloud_init_hard_timeout = 10
+    orchestrator.cloud_init_inactivity_timeout = 5
+    orchestrator.readiness_poll_interval = 1
+    sequence = CloudSequence(
+        ["running"] * 9 + ["done"],
+        [_progress("prerequisite installation", index) for index in range(10)],
+    )
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock)
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", sequence)
+
+    orchestrator._wait_for_cloud_init(
+        record,
+        Path("identity"),
+        Path("known-hosts"),
+        "ubuntu",
+        event,  # type: ignore[arg-type]
+        overall_started=0,
+    )
+    assert clock.value == 9
+
+
+def test_cloud_init_active_progress_hits_hard_maximum(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    clock = FakeClock()
+    event = AdvancingEvent(clock)
+    orchestrator.cloud_init_hard_timeout = 20
+    orchestrator.cloud_init_inactivity_timeout = 10
+    orchestrator.readiness_poll_interval = 5
+    sequence = CloudSequence(["running"], [_progress("prerequisite installation", index) for index in range(10)])
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock)
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", sequence)
+
+    with pytest.raises(TerraformError, match="progressing.*maximum provisioning time of 20s"):
+        orchestrator._wait_for_cloud_init(
+            record,
+            Path("identity"),
+            Path("known-hosts"),
+            "ubuntu",
+            event,  # type: ignore[arg-type]
+            overall_started=0,
+        )
+
+
+def test_ssh_and_wireguard_have_separate_timeouts(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    clock = FakeClock()
+    event = AdvancingEvent(clock)
+    orchestrator.ssh_readiness_timeout = 10
+    orchestrator.wireguard_readiness_timeout = 15
+    orchestrator.readiness_poll_interval = 5
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock)
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("closed")))
+    with pytest.raises(TerraformError, match="SSH readiness timed out after 10s"):
+        orchestrator._wait_for_ssh(
+            record,
+            Path("identity"),
+            Path("known-hosts"),
+            "ubuntu",
+            DeploymentOptions(ssh_cidr="8.8.8.8/32"),
+            event,  # type: ignore[arg-type]
+            overall_started=0,
+            automatic_ssh_cidr=False,
+        )
+
+    clock.value = 0
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", lambda *args, **kwargs: (1, "", "not ready"))
+    with pytest.raises(TerraformError, match="WireGuard readiness timed out after 15s"):
+        orchestrator._wait_for_wireguard(
+            record,
+            Path("identity"),
+            Path("known-hosts"),
+            "ubuntu",
+            DeploymentOptions(ssh_cidr="8.8.8.8/32"),
+            event,  # type: ignore[arg-type]
+            readiness_marker="/var/lib/ephemeral-vpn/ready",
+            overall_started=0,
+        )
 
 
 def test_invalid_private_key_permissions_prevent_any_ssh_attempt(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

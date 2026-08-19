@@ -11,13 +11,13 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterator
 
 from catalog import ProviderCatalog
-from cloud_init import FAILURE_MARKER, bootstrap_source_sha256, render_user_data
+from cloud_init import FAILURE_MARKER, READINESS_MARKER, bootstrap_source_sha256, render_user_data
 from file_lock import FileLock
 from legacy_reconciliation import LegacyReconciliationStore
 from models import DeploymentOptions, DeploymentRecord, DeploymentState, StatusEvent, now_iso
@@ -45,11 +45,42 @@ LEGACY_STATE_NAMES = ("terraform.tfstate", "terraform.tfstate.backup")
 TERRAFORM_WORK_ROOT = "terraform-work"
 TERRAFORM_WORK_MANIFEST = "terraform-work-manifest.json"
 USER_DATA_MANIFEST = "user-data-manifest.json"
+SSH_READINESS_TIMEOUT_SECONDS = 120.0
+CLOUD_INIT_HARD_TIMEOUT_SECONDS = 900.0
+CLOUD_INIT_INACTIVITY_TIMEOUT_SECONDS = 180.0
+WIREGUARD_READINESS_TIMEOUT_SECONDS = 120.0
+READINESS_POLL_INTERVAL_SECONDS = 5.0
+CLOUD_INIT_PROGRESS_LOG_INTERVAL_SECONDS = 30.0
+CLOUD_INIT_PROGRESS_COMMAND = (
+    "output=/var/log/cloud-init-output.log; "
+    'if [ -r "$output" ]; then '
+    "sed -n 's/^ephemeral-vpn bootstrap phase: \\([A-Za-z0-9 /_-]\\{1,80\\}\\)$/phase=\\1/p' "
+    '"$output" | tail -n 1; '
+    "sed -n 's/^ephemeral-vpn bootstrap build: \\([0-9a-f]\\{12\\}\\)$/build=\\1/p' "
+    '"$output" | tail -n 1; '
+    "stat -c 'activity_epoch=%Y' \"$output\"; "
+    "stat -c 'activity_size=%s' \"$output\"; "
+    "fi; "
+    f"if [ -f {READINESS_MARKER} ]; then echo ready=1; else echo ready=0; fi"
+)
 PROVIDER_RESOURCE_PREFIXES = {
     "aws-lightsail": "aws_lightsail_",
     "digitalocean": "digitalocean_",
     "scaleway": "scaleway_",
 }
+
+
+@dataclass(frozen=True)
+class CloudInitProgress:
+    phase: str | None
+    build: str | None
+    activity_epoch: int | None
+    activity_size: int | None
+    ready: bool
+
+    @property
+    def token(self) -> tuple[str | None, int | None, int | None]:
+        return (self.phase, self.activity_epoch, self.activity_size)
 
 
 class Orchestrator:
@@ -60,7 +91,12 @@ class Orchestrator:
         runner: TerraformRunner | None = None,
         *,
         ip_detector: IpDetector = detect_public_ipv4,
-        readiness_timeout: float = 300,
+        readiness_timeout: float | None = None,
+        ssh_readiness_timeout: float = SSH_READINESS_TIMEOUT_SECONDS,
+        cloud_init_hard_timeout: float = CLOUD_INIT_HARD_TIMEOUT_SECONDS,
+        cloud_init_inactivity_timeout: float = CLOUD_INIT_INACTIVITY_TIMEOUT_SECONDS,
+        wireguard_readiness_timeout: float = WIREGUARD_READINESS_TIMEOUT_SECONDS,
+        readiness_poll_interval: float = READINESS_POLL_INTERVAL_SECONDS,
     ) -> None:
         self.resource_root = resource_root.resolve()
         self.runtime_root = runtime_root.resolve()
@@ -71,7 +107,24 @@ class Orchestrator:
         self.legacy_reconciliations = LegacyReconciliationStore(self.runtime_root / "legacy-reconciliations")
         self.runner = runner or TerraformRunner()
         self.ip_detector = ip_detector
-        self.readiness_timeout = readiness_timeout
+        if readiness_timeout is not None:
+            cloud_init_hard_timeout = readiness_timeout
+        timeouts = (
+            ssh_readiness_timeout,
+            cloud_init_hard_timeout,
+            cloud_init_inactivity_timeout,
+            wireguard_readiness_timeout,
+            readiness_poll_interval,
+        )
+        if any(value <= 0 for value in timeouts):
+            raise ValueError("Readiness timeouts must be positive")
+        if cloud_init_inactivity_timeout >= cloud_init_hard_timeout:
+            raise ValueError("Cloud-init inactivity timeout must be shorter than its hard timeout")
+        self.ssh_readiness_timeout = ssh_readiness_timeout
+        self.cloud_init_hard_timeout = cloud_init_hard_timeout
+        self.cloud_init_inactivity_timeout = cloud_init_inactivity_timeout
+        self.wireguard_readiness_timeout = wireguard_readiness_timeout
+        self.readiness_poll_interval = readiness_poll_interval
         self._cancellations: dict[str, threading.Event] = {}
         self._events: list[StatusEvent] = []
         self._legacy_snapshot_lock = threading.RLock()
@@ -398,8 +451,6 @@ class Orchestrator:
     ) -> None:
         assert record.public_ip
         self._raise_if_cancelled(cancel)
-        deadline = time.monotonic() + self.readiness_timeout
-        last_error = "SSH did not become ready"
         user = "ubuntu" if record.provider_id == "aws-lightsail" else "root"
         runtime = Path(record.runtime_directory)
         identity = runtime / "ssh.privatekey"
@@ -408,67 +459,76 @@ class Orchestrator:
             verify_private_file(identity)
         except PrivateFileSecurityError as exc:
             raise TerraformError(f"Local SSH private-key security check failed: {exc}") from exc
-        wireguard_check = (
-            f"test -f {readiness_marker} && "
-            "systemctl is-enabled --quiet wg-quick@wg0 && "
-            "systemctl is-active --quiet wg-quick@wg0 && "
-            "ip link show wg0 >/dev/null && "
-            'test "$(sysctl -n net.ipv4.ip_forward)" = 1 && '
-            "iptables -t nat -C POSTROUTING -j MASQUERADE && "
-            f"ss -H -lun 'sport = :{options.wireguard_port}' | grep -q ."
+        overall_started = time.monotonic()
+        record.readiness_started_at = record.readiness_started_at or now_iso()
+        record.provisioning_elapsed_seconds = 0
+        self.deployments.save(record)
+        self._wait_for_ssh(
+            record,
+            identity,
+            known_hosts,
+            user,
+            options,
+            cancel,
+            overall_started=overall_started,
+            automatic_ssh_cidr=automatic_ssh_cidr,
         )
+        self._transition(
+            record, DeploymentState.WAITING_FOR_CLOUD_INIT, "SSH is ready; waiting for cloud initialization"
+        )
+        self._wait_for_cloud_init(
+            record,
+            identity,
+            known_hosts,
+            user,
+            cancel,
+            overall_started=overall_started,
+        )
+        self._transition(
+            record,
+            DeploymentState.CHECKING_WIREGUARD,
+            "Cloud initialization succeeded; checking WireGuard readiness",
+        )
+        self._wait_for_wireguard(
+            record,
+            identity,
+            known_hosts,
+            user,
+            options,
+            cancel,
+            readiness_marker=readiness_marker,
+            overall_started=overall_started,
+        )
+
+    def _wait_for_ssh(
+        self,
+        record: DeploymentRecord,
+        identity: Path,
+        known_hosts: Path,
+        user: str,
+        options: DeploymentOptions,
+        cancel: threading.Event,
+        *,
+        overall_started: float,
+        automatic_ssh_cidr: bool,
+    ) -> None:
+        assert record.public_ip
+        started = time.monotonic()
+        last_error = "SSH did not become ready"
         attempts = 0
         ip_refresh_attempted = False
-        cloud_init_complete = False
-        while time.monotonic() < deadline:
+        while True:
             self._raise_if_cancelled(cancel)
             attempts += 1
             try:
                 with socket.create_connection((record.public_ip, 22), timeout=3):
                     pass
-                if not cloud_init_complete:
-                    args = self._ssh_command(identity, known_hosts, user, record.public_ip, "cloud-init status --long")
-                    returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=20)
-                    combined = (stdout + "\n" + stderr).strip()
-                    status = self._cloud_init_status(returncode, combined)
-                    if status == "error":
-                        failure_args = self._ssh_command(
-                            identity,
-                            known_hosts,
-                            user,
-                            record.public_ip,
-                            f"if [ -r {FAILURE_MARKER} ]; then cat {FAILURE_MARKER}; fi",
-                        )
-                        _failure_code, failure_stdout, failure_stderr = self._run_cancellable_process(
-                            failure_args, cancel, timeout=20
-                        )
-                        diagnostic = self._cloud_init_failure_diagnostic(
-                            "\n".join((combined, failure_stdout, failure_stderr))
-                        )
-                        if diagnostic:
-                            raise TerraformError(
-                                f"Cloud initialization failed during {diagnostic}. "
-                                "Cloud resources may exist and must be destroyed."
-                            )
-                        raise TerraformError(
-                            "Cloud initialization failed during bootstrap. "
-                            "Cloud resources may exist and must be destroyed."
-                        )
-                    if status != "done":
-                        last_error = "Cloud initialization is still running"
-                    else:
-                        cloud_init_complete = True
-                        self._transition(
-                            record,
-                            DeploymentState.CHECKING_WIREGUARD,
-                            "Cloud initialization succeeded; checking WireGuard readiness",
-                        )
-                if cloud_init_complete:
-                    args = self._ssh_command(identity, known_hosts, user, record.public_ip, wireguard_check)
-                    returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=20)
-                    if returncode == 0:
-                        return
-                    last_error = redact((stderr or stdout).strip())[-500:] or "WireGuard is not ready"
+                args = self._ssh_command(identity, known_hosts, user, record.public_ip, "true")
+                returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=20)
+                if returncode == 0:
+                    self._persist_provisioning_elapsed(record, overall_started)
+                    return
+                last_error = redact((stderr or stdout).strip())[-500:] or f"SSH exited {returncode}"
             except TerraformCancelled:
                 raise
             except (OSError, subprocess.SubprocessError) as exc:
@@ -483,9 +543,196 @@ class Orchestrator:
                         options = replace(options, ssh_cidr=detected)
                 except (PublicIpDetectionError, TerraformError) as exc:
                     last_error = redact(str(exc))
-            if cancel.wait(5):
-                raise TerraformCancelled("Deployment cancelled during server readiness checks")
-        raise TerraformError(f"Server readiness checks timed out: {last_error}")
+            elapsed = time.monotonic() - started
+            self._persist_provisioning_elapsed(record, overall_started)
+            if elapsed >= self.ssh_readiness_timeout:
+                raise TerraformError(f"SSH readiness timed out after {self._duration_text(elapsed)}: {last_error}")
+            if cancel.wait(self.readiness_poll_interval):
+                raise TerraformCancelled("Deployment cancelled during SSH readiness checks")
+
+    def _wait_for_cloud_init(
+        self,
+        record: DeploymentRecord,
+        identity: Path,
+        known_hosts: Path,
+        user: str,
+        cancel: threading.Event,
+        *,
+        overall_started: float,
+    ) -> None:
+        assert record.public_ip
+        started = time.monotonic()
+        last_progress = started
+        last_log = started - CLOUD_INIT_PROGRESS_LOG_INTERVAL_SECONDS
+        last_token: tuple[str | None, int | None, int | None] | None = None
+        expected_build = self._expected_bootstrap_build(record)
+        while True:
+            self._raise_if_cancelled(cancel)
+            args = self._ssh_command(identity, known_hosts, user, record.public_ip, "cloud-init status --long")
+            returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=20)
+            combined = (stdout + "\n" + stderr).strip()
+            status = self._cloud_init_status(returncode, combined)
+            if status == "error":
+                failure_args = self._ssh_command(
+                    identity,
+                    known_hosts,
+                    user,
+                    record.public_ip,
+                    f"if [ -r {FAILURE_MARKER} ]; then cat {FAILURE_MARKER}; fi",
+                )
+                _failure_code, failure_stdout, failure_stderr = self._run_cancellable_process(
+                    failure_args, cancel, timeout=20
+                )
+                diagnostic = self._cloud_init_failure_diagnostic("\n".join((combined, failure_stdout, failure_stderr)))
+                if diagnostic:
+                    raise TerraformError(
+                        f"Cloud initialization failed during {diagnostic}. "
+                        "Cloud resources may exist and must be destroyed."
+                    )
+                raise TerraformError(
+                    "Cloud initialization failed during bootstrap. Cloud resources may exist and must be destroyed."
+                )
+
+            progress_args = self._ssh_command(
+                identity, known_hosts, user, record.public_ip, CLOUD_INIT_PROGRESS_COMMAND
+            )
+            progress_code, progress_stdout, _progress_stderr = self._run_cancellable_process(
+                progress_args, cancel, timeout=20
+            )
+            progress = self._cloud_init_progress(progress_stdout if progress_code == 0 else "")
+            if expected_build and progress.build and progress.build != expected_build:
+                raise TerraformError(
+                    "Remote bootstrap build fingerprint differs from the deployment runtime manifest; "
+                    "cloud resources may exist and must be destroyed."
+                )
+
+            now = time.monotonic()
+            meaningful_progress = any(value is not None for value in progress.token)
+            changed = meaningful_progress and progress.token != last_token
+            previous_phase = record.bootstrap_phase
+            if changed:
+                last_progress = now
+                last_token = progress.token
+                record.bootstrap_last_progress_at = now_iso()
+            if progress.phase:
+                record.bootstrap_phase = progress.phase
+            elif not record.bootstrap_phase:
+                record.bootstrap_phase = "cloud-init startup"
+            phase_changed = record.bootstrap_phase != previous_phase
+            elapsed = now - started
+            inactivity = now - last_progress
+            self._persist_provisioning_elapsed(record, overall_started)
+
+            if status == "done":
+                if changed:
+                    self._log(record.id, f"Cloud init completed ({self._duration_text(elapsed)})")
+                return
+            if phase_changed:
+                self._log(record.id, f"Cloud init: {record.bootstrap_phase} ({self._duration_text(elapsed)})")
+                last_log = now
+            elif now - last_log >= CLOUD_INIT_PROGRESS_LOG_INTERVAL_SECONDS:
+                self._log(
+                    record.id,
+                    f"Cloud init still active during {record.bootstrap_phase}; "
+                    f"latest progress {self._duration_text(inactivity)} ago; "
+                    f"elapsed {self._duration_text(elapsed)}",
+                )
+                last_log = now
+
+            if inactivity >= self.cloud_init_inactivity_timeout:
+                raise TerraformError(
+                    f"Cloud initialization stalled during {record.bootstrap_phase}; "
+                    f"no safe progress for {self._duration_text(inactivity)}. "
+                    "Cloud resources may exist and must be destroyed."
+                )
+            if elapsed >= self.cloud_init_hard_timeout:
+                raise TerraformError(
+                    f"Cloud initialization is progressing during {record.bootstrap_phase} but exceeded the "
+                    f"maximum provisioning time of {self._duration_text(self.cloud_init_hard_timeout)}. "
+                    "Cloud resources may exist and must be destroyed."
+                )
+            if cancel.wait(self.readiness_poll_interval):
+                raise TerraformCancelled("Deployment cancelled while waiting for cloud initialization")
+
+    def _wait_for_wireguard(
+        self,
+        record: DeploymentRecord,
+        identity: Path,
+        known_hosts: Path,
+        user: str,
+        options: DeploymentOptions,
+        cancel: threading.Event,
+        *,
+        readiness_marker: str,
+        overall_started: float,
+    ) -> None:
+        assert record.public_ip
+        started = time.monotonic()
+        last_error = "WireGuard is not ready"
+        wireguard_check = (
+            f"test -f {readiness_marker} && "
+            "systemctl is-enabled --quiet wg-quick@wg0 && "
+            "systemctl is-active --quiet wg-quick@wg0 && "
+            "ip link show wg0 >/dev/null && "
+            'test "$(sysctl -n net.ipv4.ip_forward)" = 1 && '
+            "iptables -t nat -C POSTROUTING -j MASQUERADE && "
+            f"ss -H -lun 'sport = :{options.wireguard_port}' | grep -q ."
+        )
+        while True:
+            self._raise_if_cancelled(cancel)
+            try:
+                args = self._ssh_command(identity, known_hosts, user, record.public_ip, wireguard_check)
+                returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=20)
+                if returncode == 0:
+                    self._persist_provisioning_elapsed(record, overall_started)
+                    return
+                last_error = redact((stderr or stdout).strip())[-500:] or "WireGuard readiness check failed"
+            except TerraformCancelled:
+                raise
+            except (OSError, subprocess.SubprocessError) as exc:
+                last_error = redact(str(exc))
+            elapsed = time.monotonic() - started
+            self._persist_provisioning_elapsed(record, overall_started)
+            if elapsed >= self.wireguard_readiness_timeout:
+                raise TerraformError(
+                    f"WireGuard readiness timed out after {self._duration_text(elapsed)}: {last_error}. "
+                    "Cloud resources may exist and must be destroyed."
+                )
+            if cancel.wait(self.readiness_poll_interval):
+                raise TerraformCancelled("Deployment cancelled during WireGuard readiness checks")
+
+    def _persist_provisioning_elapsed(self, record: DeploymentRecord, started: float) -> None:
+        record.provisioning_elapsed_seconds = max(0, int(time.monotonic() - started))
+        self.deployments.save(record)
+
+    def _expected_bootstrap_build(self, record: DeploymentRecord) -> str | None:
+        manifest_path = Path(record.runtime_directory) / USER_DATA_MANIFEST
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        build = manifest.get("bootstrap_build") if isinstance(manifest, dict) else None
+        return build.lower() if isinstance(build, str) and re.fullmatch(r"[0-9a-fA-F]{12}", build) else None
+
+    @staticmethod
+    def _cloud_init_progress(output: str) -> CloudInitProgress:
+        phase_match = re.search(r"(?m)^phase=([A-Za-z0-9 /_-]{1,80})$", output)
+        build_match = re.search(r"(?m)^build=([0-9a-f]{12})$", output, flags=re.IGNORECASE)
+        epoch_match = re.search(r"(?m)^activity_epoch=([0-9]{1,12})$", output)
+        size_match = re.search(r"(?m)^activity_size=([0-9]{1,12})$", output)
+        return CloudInitProgress(
+            phase_match.group(1).strip() if phase_match else None,
+            build_match.group(1).lower() if build_match else None,
+            int(epoch_match.group(1)) if epoch_match else None,
+            int(size_match.group(1)) if size_match else None,
+            bool(re.search(r"(?m)^ready=1$", output)),
+        )
+
+    @staticmethod
+    def _duration_text(seconds: float) -> str:
+        total = max(0, int(seconds))
+        minutes, remainder = divmod(total, 60)
+        return f"{minutes}m{remainder:02d}s" if minutes else f"{remainder}s"
 
     @staticmethod
     def _ssh_command(identity: Path, known_hosts: Path, user: str, public_ip: str, remote_command: str) -> list[str]:

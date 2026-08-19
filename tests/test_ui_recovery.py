@@ -64,3 +64,20 @@ def test_log_rendering_is_bound_to_active_or_selected_deployment() -> None:
         "selected": True,
         "staleResponse": False,
     }
+
+
+def test_cloud_init_progress_label_uses_safe_persisted_backend_fields() -> None:
+    script = (
+        "const result={"
+        "progress:state.cloudInitStatus({state:'waiting_for_cloud_init',"
+        "bootstrap_phase:'prerequisite installation',provisioning_elapsed_seconds:192}),"
+        "invalid:state.cloudInitStatus({state:'waiting_for_cloud_init',bootstrap_phase:'<secret>',provisioning_elapsed_seconds:-1}),"
+        "other:state.cloudInitStatus({state:'checking_wireguard',"
+        "bootstrap_phase:'final readiness validation',provisioning_elapsed_seconds:200})"
+        "};process.stdout.write(JSON.stringify(result));"
+    )
+    assert run_recovery_state(script) == {
+        "progress": "Cloud init: prerequisite installation (3m12s)",
+        "invalid": "Cloud init: startup (0m00s)",
+        "other": None,
+    }

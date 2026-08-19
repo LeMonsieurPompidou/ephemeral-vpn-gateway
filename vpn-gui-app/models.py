@@ -110,6 +110,10 @@ class DeploymentRecord:
     plan_completed_at: str | None = None
     apply_started_at: str | None = None
     apply_completed_at: str | None = None
+    readiness_started_at: str | None = None
+    bootstrap_phase: str | None = None
+    bootstrap_last_progress_at: str | None = None
+    provisioning_elapsed_seconds: int | None = None
     destroyed_at: str | None = None
     state_present: bool = False
     resources_possible: bool = False

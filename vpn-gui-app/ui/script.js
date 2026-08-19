@@ -17,7 +17,7 @@ function providerBlocked(){ return legacyStates.some((item)=>item.provider_id===
 function setState(record, expectedId=deploymentId){
   if(!RecoveryState.acceptsBackendRecord(currentRecord,record,expectedId))return false;
   currentRecord=currentRecord?.id===record.id?{...currentRecord,...record}:{...record}; deploymentId=expectedId;
-  const state=currentRecord.state||'idle'; $('status-text').textContent=stateLabel(state); $('status-dot').className=`status-indicator ${state}`;
+  const state=currentRecord.state||'idle'; $('status-text').textContent=RecoveryState.cloudInitStatus(currentRecord)||stateLabel(state); $('status-dot').className=`status-indicator ${state}`;
   $('ip-address').textContent=currentRecord.public_ip||'—'; $('copy-ip').disabled=!currentRecord.public_ip;
   $('expires').textContent=currentRecord.expires_at?new Date(currentRecord.expires_at).toLocaleString():'—';
   updateActionButtons();

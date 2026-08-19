@@ -39,5 +39,16 @@
     return !activeId || requestedId === activeId;
   }
 
-  return { acceptsBackendRecord, canRenderLogs, selectionAfterRefresh };
+  function cloudInitStatus(record) {
+    if (!record || record.state !== 'waiting_for_cloud_init') return null;
+    const rawPhase = typeof record.bootstrap_phase === 'string' ? record.bootstrap_phase : '';
+    const phase = /^[A-Za-z0-9 /_-]{1,80}$/.test(rawPhase) ? rawPhase : 'startup';
+    const rawElapsed = Number(record.provisioning_elapsed_seconds);
+    const elapsed = Number.isFinite(rawElapsed) && rawElapsed >= 0 ? Math.floor(rawElapsed) : 0;
+    const minutes = Math.floor(elapsed / 60);
+    const seconds = String(elapsed % 60).padStart(2, '0');
+    return `Cloud init: ${phase} (${minutes}m${seconds}s)`;
+  }
+
+  return { acceptsBackendRecord, canRenderLogs, cloudInitStatus, selectionAfterRefresh };
 });
