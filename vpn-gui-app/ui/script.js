@@ -2,14 +2,15 @@ const STATES = ['validating_credentials','initializing','planning','provisioning
 const $ = (id) => document.getElementById(id);
 let providers = [], locations = [], legacyStates = [], deploymentId = null, operationId = null;
 let activeDeploymentId = null, currentRecord = null, selectedRecoveryId = null, startedAt = null, timer = null;
-let syncInFlight = false;
+let syncInFlight = false, uiBusy = false;
 const api = () => window.pywebview?.api;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function selectedProvider(){ return providers.find((p) => p.id === $('provider').value); }
 function selectedLocation(){ return locations.find((l) => l.id === $('location').value); }
 function option(el, value, label){ const node=document.createElement('option'); node.value=value; node.textContent=label; el.append(node); }
-function setBusy(busy){ $('deploy').disabled=busy || providerBlocked(); $('validate-credentials').disabled=busy; $('cancel').disabled=!busy || !deploymentId; $('provider').disabled=busy; $('country').disabled=busy; $('location').disabled=busy; }
+function updateActionButtons(){const state=currentRecord?.state||'idle';const cloudPossible=Boolean(currentRecord?.resources_possible||currentRecord?.apply_started_at);const terminal=['failed','cancelled','ready'].includes(state);$('destroy').disabled=uiBusy||!deploymentId||!cloudPossible||state==='destroyed'||state==='destroying';$('remove-local').disabled=uiBusy||!deploymentId||cloudPossible||!terminal;}
+function setBusy(busy){ uiBusy=busy; $('deploy').disabled=busy || providerBlocked(); $('validate-credentials').disabled=busy; $('cancel').disabled=!busy || !deploymentId; $('provider').disabled=busy; $('country').disabled=busy; $('location').disabled=busy; updateActionButtons(); }
 function stateLabel(value){ return String(value).replaceAll('_',' ').replace(/^./,(c)=>c.toUpperCase()); }
 function renderSteps(state){ $('steps').replaceChildren(...STATES.map((value)=>{ const li=document.createElement('li'); li.textContent=stateLabel(value); const index=STATES.indexOf(state); li.className=STATES.indexOf(value)<index?'done':value===state?'active':''; return li; })); }
 function providerBlocked(){ return legacyStates.some((item)=>item.provider_id===$('provider').value && item.blocking); }
@@ -19,10 +20,7 @@ function setState(record, expectedId=deploymentId){
   const state=currentRecord.state||'idle'; $('status-text').textContent=stateLabel(state); $('status-dot').className=`status-indicator ${state}`;
   $('ip-address').textContent=currentRecord.public_ip||'—'; $('copy-ip').disabled=!currentRecord.public_ip;
   $('expires').textContent=currentRecord.expires_at?new Date(currentRecord.expires_at).toLocaleString():'—';
-  const cloudPossible=Boolean(currentRecord.resources_possible||currentRecord.apply_started_at);
-  const terminal=['failed','cancelled','ready'].includes(state);
-  $('destroy').disabled=!deploymentId||!cloudPossible||state==='destroyed'||state==='destroying';
-  $('remove-local').disabled=!deploymentId||cloudPossible||!terminal;
+  updateActionButtons();
   renderSteps(state);
   return true;
 }
@@ -43,14 +41,17 @@ function deploymentOptions(){
 }
 async function deploy(){
   if(providerBlocked())throw new Error('This provider has unreconciled legacy Terraform state. Review the recovery warning first.');
+  if(operationId||activeDeploymentId)throw new Error('Another deployment operation is already active.');
   selectedRecoveryId=null;
   setBusy(true); startedAt=Date.now(); startTimer();
   const response=await api().start_deploy($('provider').value,$('location').value,deploymentOptions());
+  if(response.status!=='started')throw new Error(response.message||'Deployment could not be started.');
   const startedOperationId=response.operation_id; operationId=startedOperationId;
   activeDeploymentId=response.deployment_id; deploymentId=activeDeploymentId; currentRecord=null;
   try{
     while(operationId===startedOperationId){
       const status=await api().operation_status(startedOperationId);
+      if(status.status==='error')throw new Error(status.message||'Deployment status is unavailable.');
       if(status.deployment?.id===activeDeploymentId)setState(status.deployment,activeDeploymentId);
       await refreshLogs(activeDeploymentId);
       if(status.status==='complete'){
@@ -68,7 +69,8 @@ async function deploy(){
   }
 }
 async function refreshLogs(targetId=deploymentId){
-  if(!targetId)return; const lines=await api().get_logs(targetId);
+  if(!targetId)return; let lines;
+  try{lines=await api().get_logs(targetId);}catch{return;}
   if(!RecoveryState.canRenderLogs(targetId,deploymentId,activeDeploymentId))return;
   $('logs').textContent=lines.join('\n'); $('logs').scrollTop=$('logs').scrollHeight;
 }
@@ -139,6 +141,6 @@ function startTimer(){ clearInterval(timer); timer=setInterval(()=>{if(startedAt
 async function validateCredentials(){const result=await api().validate_credentials($('provider').value);alert(result.message);}
 async function initialize(){ if(!api()){setTimeout(initialize,100);return;} providers=await api().list_providers(); $('provider').replaceChildren(); providers.forEach((p)=>option($('provider'),p.id,p.display_name)); refreshLocations(); renderSteps('idle'); await loadLegacyStates(); await loadRecovery(); setInterval(()=>{if(!document.hidden)reconcileCurrentDeployment().catch(()=>{});},1000); setInterval(()=>{if(!document.hidden)loadRecovery().catch(()=>{});},5000); }
 $('provider').addEventListener('change',()=>{refreshLocations();setBusy(false);}); $('country').addEventListener('change',refreshRegions); $('location').addEventListener('change',refreshBadges); $('traffic-mode').addEventListener('change',()=>{$('allowed-ips').disabled=$('traffic-mode').value!=='custom';if($('traffic-mode').value==='ipv4')$('allowed-ips').value='0.0.0.0/0';});
-$('deploy').addEventListener('click',()=>deploy().catch((e)=>{alert(e.message);setBusy(false);})); $('validate-credentials').addEventListener('click',()=>validateCredentials().catch((e)=>alert(e.message))); $('destroy').addEventListener('click',destroy); $('remove-local').addEventListener('click',removeLocal); $('cancel').addEventListener('click',async()=>{if(deploymentId)await api().cancel(deploymentId);});
+$('deploy').addEventListener('click',()=>deploy().catch((e)=>{alert(e.message);setBusy(Boolean(operationId||activeDeploymentId));})); $('validate-credentials').addEventListener('click',()=>validateCredentials().catch((e)=>alert(e.message))); $('destroy').addEventListener('click',destroy); $('remove-local').addEventListener('click',removeLocal); $('cancel').addEventListener('click',async()=>{if(deploymentId)await api().cancel(deploymentId);});
 $('copy-ip').addEventListener('click',()=>navigator.clipboard.writeText($('ip-address').textContent)); $('save-config').addEventListener('click',async()=>{const destination=prompt('Save to an absolute path (for example C:\\Users\\you\\WireGuard\\vpn.conf):');if(destination)await api().save_client_config(deploymentId,destination);});
 window.addEventListener('beforeunload',(event)=>{if(currentRecord?.resources_possible&&currentRecord.state!=='destroyed'){event.preventDefault();event.returnValue='Active cloud resources may still exist.';}}); document.addEventListener('DOMContentLoaded',initialize);

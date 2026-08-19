@@ -1,10 +1,16 @@
 locals {
   vpn_name = "ephemeral-vpn-do-${substr(var.deployment_id, 0, 8)}"
-  cloud_init = templatefile("${path.module}/../terraform-common/cloud-init.yaml.tftpl", {
-    wireguard_port     = var.wireguard_port
-    server_private_key = var.server_private_key
-    client_public_key  = var.client_public_key
-  })
+  bootstrap_script = replace(replace(replace(
+    file("${path.module}/../terraform-common/bootstrap.sh.tftpl"),
+    "@@WIREGUARD_PORT@@", tostring(var.wireguard_port)),
+    "@@SERVER_PRIVATE_KEY@@", var.server_private_key),
+  "@@CLIENT_PUBLIC_KEY@@", var.client_public_key)
+  cloud_init = replace(
+    file("${path.module}/../terraform-common/cloud-init.yaml.tftpl"),
+    "@@BOOTSTRAP_SCRIPT@@",
+    indent(6, chomp(local.bootstrap_script)),
+  )
+  user_data = var.user_data_payload != null ? var.user_data_payload : local.cloud_init
 }
 
 data "digitalocean_ssh_key" "existing" {
@@ -24,7 +30,7 @@ resource "digitalocean_droplet" "vpn" {
   image     = "ubuntu-24-04-x64"
   region    = var.region
   ssh_keys  = var.ssh_public_key == null ? [data.digitalocean_ssh_key.existing[0].id] : [digitalocean_ssh_key.vpn[0].id]
-  user_data = local.cloud_init
+  user_data = local.user_data
   tags      = compact(["wireguard", "ephemeral-vpn", "deployment:${var.deployment_id}", var.expires_at == null ? "" : "expires-at:${var.expires_at}"])
   lifecycle {
     precondition {

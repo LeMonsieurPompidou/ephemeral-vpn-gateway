@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+READY_MARKER=/var/lib/ephemeral-vpn/ready
+phase="prerequisite/package setup"
+trap 'code=$?; echo "ephemeral-vpn bootstrap failed in phase ${phase} (exit ${code})" >&2; exit "${code}"' ERR
+echo "ephemeral-vpn bootstrap phase: ${phase}"
+rm -f "${READY_MARKER}"
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v wg >/dev/null || ! command -v wg-quick >/dev/null || ! command -v iptables >/dev/null; then
+  apt-get update
+  apt-get install -y iptables wireguard
+fi
+command -v systemctl >/dev/null
+command -v iptables >/dev/null
+command -v wg >/dev/null
+command -v wg-quick >/dev/null
+
+phase="SSH hardening/configuration"
+echo "ephemeral-vpn bootstrap phase: ${phase}"
+install -d -m 0755 /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-ephemeral-vpn.conf <<'SSH_CONFIG'
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+SSH_CONFIG
+chmod 0644 /etc/ssh/sshd_config.d/99-ephemeral-vpn.conf
+command -v sshd >/dev/null
+sshd -t
+ssh_service=""
+for candidate in ssh.service sshd.service; do
+  if systemctl cat "${candidate}" >/dev/null 2>&1; then
+    ssh_service="${candidate}"
+    break
+  fi
+done
+if [ -z "${ssh_service}" ]; then
+  echo "ephemeral-vpn bootstrap: neither ssh.service nor sshd.service is available" >&2
+  exit 1
+fi
+systemctl restart "${ssh_service}"
+systemctl is-active --quiet "${ssh_service}"
+
+phase="WireGuard configuration"
+echo "ephemeral-vpn bootstrap phase: ${phase}"
+install -d -m 0700 /etc/wireguard
+cat > /etc/wireguard/wg0.conf <<'WG_CONFIG'
+[Interface]
+Address = 10.8.0.1/24
+ListenPort = @@WIREGUARD_PORT@@
+PrivateKey = @@SERVER_PRIVATE_KEY@@
+PostUp = OUTBOUND_IFACE="$(ip route show default | awk '/default/ {print $5; exit}')"; iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o "$OUTBOUND_IFACE" -j MASQUERADE
+PostDown = OUTBOUND_IFACE="$(ip route show default | awk '/default/ {print $5; exit}')"; iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o "$OUTBOUND_IFACE" -j MASQUERADE
+
+[Peer]
+PublicKey = @@CLIENT_PUBLIC_KEY@@
+AllowedIPs = 10.8.0.2/32
+WG_CONFIG
+chmod 0600 /etc/wireguard/wg0.conf
+wg-quick strip wg0 >/dev/null
+
+phase="forwarding/NAT/sysctl"
+echo "ephemeral-vpn bootstrap phase: ${phase}"
+cat > /etc/sysctl.d/99-wireguard.conf <<'SYSCTL_CONFIG'
+net.ipv4.ip_forward=1
+SYSCTL_CONFIG
+chmod 0644 /etc/sysctl.d/99-wireguard.conf
+sysctl --system >/dev/null
+test "$(sysctl -n net.ipv4.ip_forward)" = 1
+OUTBOUND_IFACE="$(ip route show default | awk '/default/ {print $5; exit}')"
+test -n "${OUTBOUND_IFACE}"
+
+phase="WireGuard service enable/start"
+echo "ephemeral-vpn bootstrap phase: ${phase}"
+systemctl enable --now wg-quick@wg0
+
+phase="final readiness validation"
+echo "ephemeral-vpn bootstrap phase: ${phase}"
+systemctl is-enabled --quiet wg-quick@wg0
+systemctl is-active --quiet wg-quick@wg0
+wg show wg0 >/dev/null
+ip link show wg0 >/dev/null
+test "$(sysctl -n net.ipv4.ip_forward)" = 1
+iptables -C FORWARD -i wg0 -j ACCEPT
+iptables -t nat -C POSTROUTING -o "${OUTBOUND_IFACE}" -j MASQUERADE
+ss -H -lun 'sport = :@@WIREGUARD_PORT@@' | grep -q .
+install -d -m 0755 /var/lib/ephemeral-vpn
+touch "${READY_MARKER}"
+echo "ephemeral-vpn bootstrap complete"

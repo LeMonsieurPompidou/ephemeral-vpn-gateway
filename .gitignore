@@ -63,6 +63,7 @@ runtime/
 *.log
 .pytest_cache/
 .pytest-tmp*/
+.pytest-*/
 .backend-repro/
 .terraform-validation/
 .mypy_cache/

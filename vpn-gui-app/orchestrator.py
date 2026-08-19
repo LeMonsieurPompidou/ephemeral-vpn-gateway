@@ -10,12 +10,14 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, ContextManager
+from typing import Any, Callable, ContextManager, Iterator
 
 from catalog import ProviderCatalog
+from cloud_init import render_user_data
 from file_lock import FileLock
 from legacy_reconciliation import LegacyReconciliationStore
 from models import DeploymentOptions, DeploymentRecord, DeploymentState, StatusEvent, now_iso
@@ -72,6 +74,7 @@ class Orchestrator:
         self._cancellations: dict[str, threading.Event] = {}
         self._events: list[StatusEvent] = []
         self._legacy_snapshot_lock = threading.RLock()
+        self._deployment_creation_lock = threading.RLock()
         self._legacy_confirmation_snapshots: dict[str, dict[str, object]] = {}
         self.on_event: EventCallback | None = None
         self.on_log: LogCallback | None = None
@@ -125,6 +128,63 @@ class Orchestrator:
             provider_id, location_id, options or DeploymentOptions(), apply=False, deployment_id=deployment_id
         )
 
+    def reserve_deployment(
+        self,
+        provider_id: str,
+        location_id: str,
+        options: DeploymentOptions,
+        deployment_id: str | None = None,
+    ) -> DeploymentRecord:
+        """Atomically reserve and persist a deployment before exposing its ID."""
+        validate_options(options)
+        provider = self.providers.get(provider_id)
+        self.catalog.get_location(provider_id, location_id)
+        if not provider.info.terraform_root:
+            raise ValueError("Residential node import is not implemented yet")
+        terraform_directory = self._provider_directory(provider_id)
+        with self._deployment_creation_transaction():
+            blocking = [record for record in self.deployments.list() if record.state != DeploymentState.DESTROYED]
+            if blocking:
+                active = blocking[0]
+                raise TerraformError(f"Another deployment operation is already active: {active.id}")
+            self._assert_provider_ready_for_new_deployment(provider_id)
+            identifier = deployment_id or self.new_deployment_id()
+            runtime = (self.runtime_root / identifier).resolve()
+            runtime.mkdir(parents=True, exist_ok=False)
+            state_path = runtime / "terraform.tfstate"
+            expires = None
+            if options.expiration_minutes:
+                expires = (datetime.now(timezone.utc) + timedelta(minutes=options.expiration_minutes)).isoformat()
+            record = DeploymentRecord(
+                identifier,
+                provider_id,
+                location_id,
+                str(terraform_directory),
+                str(state_path),
+                str(runtime),
+                now_iso(),
+                expires_at=expires,
+                auto_expire=options.automatic_expiration,
+            )
+            self._assert_record_paths(record)
+            try:
+                self.deployments.save(record)
+            except Exception:
+                runtime.rmdir()
+                raise
+            return record
+
+    def deploy_reserved(self, deployment_id: str, options: DeploymentOptions) -> dict[str, object]:
+        record = self.deployments.get(deployment_id)
+        return self._create_and_run(
+            record.provider_id,
+            record.location_id,
+            options,
+            apply=True,
+            deployment_id=deployment_id,
+            reserved=True,
+        )
+
     def deploy(
         self,
         provider_id: str,
@@ -144,34 +204,30 @@ class Orchestrator:
         *,
         apply: bool,
         deployment_id: str | None,
+        reserved: bool = False,
     ) -> dict[str, object]:
         validate_options(options)
-        self._assert_provider_ready_for_new_deployment(provider_id)
         provider = self.providers.get(provider_id)
         location = self.catalog.get_location(provider_id, location_id)
         if not provider.info.terraform_root:
             raise ValueError("Residential node import is not implemented yet")
-        terraform_directory = self._provider_directory(provider_id)
-        identifier = deployment_id or self.new_deployment_id()
-        runtime = (self.runtime_root / identifier).resolve()
-        runtime.mkdir(parents=True, exist_ok=False)
-        state_path = runtime / "terraform.tfstate"
-        expires = None
-        if options.expiration_minutes:
-            expires = (datetime.now(timezone.utc) + timedelta(minutes=options.expiration_minutes)).isoformat()
-        record = DeploymentRecord(
-            identifier,
-            provider_id,
-            location_id,
-            str(terraform_directory),
-            str(state_path),
-            str(runtime),
-            now_iso(),
-            expires_at=expires,
-            auto_expire=options.automatic_expiration,
+        record = (
+            self.deployments.get(str(deployment_id))
+            if reserved
+            else self.reserve_deployment(provider_id, location_id, options, deployment_id)
         )
+        if (
+            record.provider_id != provider_id
+            or record.location_id != location_id
+            or record.state != DeploymentState.IDLE
+        ):
+            raise TerraformError("Reserved deployment identity or lifecycle state is invalid")
         self._assert_record_paths(record)
-        self.deployments.save(record)
+        identifier = record.id
+        runtime = Path(record.runtime_directory)
+        state_path = Path(record.state_path)
+        terraform_directory = Path(record.terraform_directory)
+        expires = record.expires_at
         cancel = threading.Event()
         self._cancellations[identifier] = cancel
         try:
@@ -208,6 +264,14 @@ class Orchestrator:
                 manual_ssh_cidr = bool(options.ssh_cidr)
                 ssh_cidr = normalize_public_ipv4_cidr(options.ssh_cidr) if options.ssh_cidr else self.ip_detector()
                 effective_options = replace(options, ssh_cidr=ssh_cidr)
+                staged_common = Path(record.runtime_directory) / TERRAFORM_WORK_ROOT / "terraform-common"
+                user_data_payload = render_user_data(
+                    provider_id,
+                    staged_common,
+                    wireguard_port=effective_options.wireguard_port,
+                    server_private_key=server_private,
+                    client_public_key=client_public,
+                )
                 variables = provider.terraform_variables(location, effective_options)
                 variables.update(
                     {
@@ -217,6 +281,7 @@ class Orchestrator:
                         "server_public_key": server_public,
                         "client_public_key": client_public,
                         "ssh_public_key": ssh_public,
+                        "user_data_payload": user_data_payload,
                     }
                 )
                 var_file = runtime / "deployment.auto.tfvars.json"
@@ -557,6 +622,8 @@ class Orchestrator:
     def remove_local_deployment(self, deployment_id: str) -> dict[str, str]:
         record = self.deployments.get(deployment_id)
         self._assert_record_paths(record)
+        if record.state not in {DeploymentState.CANCELLED, DeploymentState.FAILED}:
+            raise TerraformError("Local removal is allowed only after the deployment operation has stopped")
         if record.apply_started_at or record.resources_possible or self.state_contains_resources(record):
             raise TerraformError(
                 "Local removal is blocked because cloud resources may exist; reconcile or destroy first"
@@ -590,14 +657,11 @@ class Orchestrator:
         return path.read_text(encoding="utf-8", errors="replace").splitlines()[-250:]
 
     def recovery_candidates(self) -> list[dict[str, object]]:
-        return [
-            record.to_dict()
-            for record in self.deployments.list()
-            if record.state not in {DeploymentState.DESTROYED, DeploymentState.IDLE}
-        ]
+        return [record.to_dict() for record in self.deployments.list() if record.state != DeploymentState.DESTROYED]
 
     def reconcile_interrupted(self) -> None:
         pre_apply = {
+            DeploymentState.IDLE,
             DeploymentState.VALIDATING_CREDENTIALS,
             DeploymentState.INITIALIZING,
             DeploymentState.PLANNING,
@@ -1436,6 +1500,12 @@ class Orchestrator:
         finally:
             self._assert_source_state_unchanged(source_directory, snapshot)
             self._assert_backend_invariants(record, env)
+
+    @contextmanager
+    def _deployment_creation_transaction(self) -> Iterator[None]:
+        with self._deployment_creation_lock:
+            with FileLock(self.runtime_root / "deployment-operation.lock", timeout=60):
+                yield
 
     def _provider_operation_lock(self, provider_id: str, directory: Path) -> ContextManager[None]:
         thread_lock = self.runner.lock_for(directory)

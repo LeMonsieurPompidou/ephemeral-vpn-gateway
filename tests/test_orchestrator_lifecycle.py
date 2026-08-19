@@ -30,6 +30,10 @@ def test_state_backend_is_deployment_scoped(tmp_path: Path, provider_id: str, lo
     assert "ssh_public_key" in variables
     assert "ssh_private_key" not in variables
     assert "client_private_key" not in variables
+    if provider_id == "aws-lightsail":
+        assert variables["user_data_payload"].startswith("#!/usr/bin/env bash\n")
+    else:
+        assert variables["user_data_payload"].startswith("#cloud-config\n")
     destroy = orchestrator.destroy(record.id)
     assert destroy["status"] == "success"
     assert not (runtime / "terraform.tfstate").exists()
@@ -110,6 +114,15 @@ def test_credential_validation_cancellation_is_local_only(tmp_path: Path) -> Non
     record = orchestrator.deployments.get(str(result["deployment_id"]))
     assert record.state is DeploymentState.CANCELLED
     assert not record.resources_possible
+
+
+def test_reserved_deployment_cannot_be_removed_before_operation_stops(tmp_path: Path) -> None:
+    orchestrator = make_orchestrator(tmp_path)
+    record = orchestrator.reserve_deployment("digitalocean", "nyc3", DeploymentOptions())
+    with pytest.raises(TerraformError, match="operation has stopped"):
+        orchestrator.remove_local_deployment(record.id)
+    assert orchestrator.deployments.get(record.id).state is DeploymentState.IDLE
+    assert Path(record.runtime_directory).is_dir()
 
 
 def test_destroy_uses_fresh_cancellation_token(tmp_path: Path) -> None:

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from file_lock import FileLock
-from models import DeploymentOptions
+from models import DeploymentOptions, DeploymentState
 from orchestrator import Orchestrator
 
 
@@ -72,12 +72,19 @@ class BridgeService:
         return self.orchestrator.deploy(provider_id, location_id, parse_options(options), deployment_id)
 
     def start_deploy(self, provider_id: str, location_id: str, options: dict[str, Any] | None = None) -> dict[str, str]:
+        parsed_options = parse_options(options)
+        try:
+            record = self.orchestrator.reserve_deployment(provider_id, location_id, parsed_options)
+        except Exception as exc:
+            from security import redact
+
+            return {"status": "error", "message": redact(str(exc))}
         operation_id = str(uuid.uuid4())
-        deployment_id = self.orchestrator.new_deployment_id()
+        deployment_id = record.id
 
         def target() -> None:
             try:
-                result = self.deploy(provider_id, location_id, options, deployment_id)
+                result = self.orchestrator.deploy_reserved(deployment_id, parsed_options)
             except Exception as exc:
                 from security import redact
 
@@ -94,7 +101,18 @@ class BridgeService:
         with self._lock:
             self._operations[operation_id] = thread
             self._operation_deployments[operation_id] = deployment_id
-        thread.start()
+        try:
+            thread.start()
+        except Exception as exc:
+            from security import redact
+
+            message = redact(f"Deployment worker could not start: {exc}")
+            record = self.orchestrator.deployments.get(deployment_id)
+            self.orchestrator._transition(record, DeploymentState.CANCELLED, message, error=message)
+            with self._lock:
+                self._operations.pop(operation_id, None)
+                self._operation_deployments.pop(operation_id, None)
+            return {"status": "error", "message": message, "deployment_id": deployment_id}
         return {"status": "started", "operation_id": operation_id, "deployment_id": deployment_id}
 
     def operation_status(self, operation_id: str) -> dict[str, object]:
@@ -107,7 +125,12 @@ class BridgeService:
         try:
             deployment = self.orchestrator.get_status(deployment_id)
         except KeyError:
-            deployment = {"id": deployment_id, "state": "validating_credentials"}
+            if result is None and thread.is_alive():
+                return {
+                    "status": "running",
+                    "message": "Deployment reservation is becoming visible; retry status shortly",
+                }
+            return {"status": "error", "message": "Deployment record is unavailable; refresh Recovery"}
         if result is not None:
             return {"status": "complete", "result": result, "deployment": deployment}
         return {"status": "running", "deployment": deployment}
@@ -119,12 +142,19 @@ class BridgeService:
             if len(matches) != 1:
                 return {"status": "error", "message": "Legacy provider destroy is ambiguous; choose a deployment"}
             deployment_id = str(matches[0]["id"])
+        if self._deployment_operation_is_running(deployment_id):
+            return {
+                "status": "error",
+                "message": "Deployment is still running; cancel it and wait for the operation to stop before destroy",
+            }
         return self.orchestrator.destroy(deployment_id, preserve_config)
 
     def cancel(self, deployment_id: str) -> dict[str, str]:
         return self.orchestrator.cancel(deployment_id)
 
     def remove_local_deployment(self, deployment_id: str) -> dict[str, str]:
+        if self._deployment_operation_is_running(deployment_id):
+            raise RuntimeError("Deployment is still running; cancel it and wait before removing local data")
         return self.orchestrator.remove_local_deployment(deployment_id)
 
     def get_status(self, deployment_id: str) -> dict[str, object]:

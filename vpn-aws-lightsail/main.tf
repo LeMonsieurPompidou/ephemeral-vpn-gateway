@@ -1,10 +1,11 @@
 locals {
   vpn_name = "ephemeral-vpn-lightsail-${substr(var.deployment_id, 0, 8)}"
-  cloud_init = templatefile("${path.module}/../terraform-common/cloud-init.yaml.tftpl", {
-    wireguard_port     = var.wireguard_port
-    server_private_key = var.server_private_key
-    client_public_key  = var.client_public_key
-  })
+  bootstrap_script = replace(replace(replace(
+    file("${path.module}/../terraform-common/bootstrap.sh.tftpl"),
+    "@@WIREGUARD_PORT@@", tostring(var.wireguard_port)),
+    "@@SERVER_PRIVATE_KEY@@", var.server_private_key),
+  "@@CLIENT_PUBLIC_KEY@@", var.client_public_key)
+  user_data = var.user_data_payload != null ? var.user_data_payload : local.bootstrap_script
 }
 resource "aws_lightsail_key_pair" "vpn" {
   count      = var.ssh_public_key == null ? 0 : 1
@@ -18,7 +19,7 @@ resource "aws_lightsail_instance" "vpn" {
   blueprint_id      = "ubuntu_24_04"
   bundle_id         = var.instance_type
   key_pair_name     = var.ssh_public_key == null ? var.ssh_key_pair_name : aws_lightsail_key_pair.vpn[0].name
-  user_data         = local.cloud_init
+  user_data         = local.user_data
   tags              = { Purpose = "ephemeral-wireguard", Deployment = var.deployment_id, ExpiresAt = coalesce(var.expires_at, "disabled") }
 }
 resource "aws_lightsail_static_ip" "vpn" {
