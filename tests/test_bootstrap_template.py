@@ -27,6 +27,42 @@ def rendered(provider_id: str) -> str:
     )
 
 
+def bootstrap_from_payload(provider_id: str, payload: str) -> str:
+    if provider_id == "aws-lightsail":
+        return payload
+    document = yaml.safe_load(payload)
+    return next(item["content"] for item in document["write_files"] if item["path"].endswith("bootstrap"))
+
+
+def simulate_ssh_phase(
+    bootstrap: str,
+    load_states: dict[str, list[str]],
+    *,
+    restart_succeeds: bool = True,
+) -> tuple[str | None, list[str], int, bool, bool]:
+    """Exercise the rendered resolver's declared candidates and bounded attempts."""
+    candidates_match = re.search(r"for candidate in ([^;]+); do", bootstrap)
+    attempts_match = re.search(r"for attempt in ([^;]+); do", bootstrap)
+    assert candidates_match and attempts_match
+    candidates = candidates_match.group(1).split()
+    attempts = attempts_match.group(1).split()
+    selected = None
+    probes = 0
+    for attempt_index, _attempt in enumerate(attempts):
+        for candidate in candidates:
+            values = load_states[candidate]
+            state = values[min(attempt_index, len(values) - 1)]
+            probes += 1
+            if state == "loaded":
+                selected = candidate
+                break
+        if selected:
+            break
+    restarts = [selected] if selected else []
+    ssh_ready = bool(selected and restart_succeeds)
+    return selected, restarts, probes, ssh_ready, ssh_ready
+
+
 def test_aws_lightsail_receives_an_explicit_shell_launch_script() -> None:
     payload = rendered("aws-lightsail")
     assert payload.encode("utf-8").startswith(b"#!/usr/bin/env bash\nset -Eeuo pipefail\n")
@@ -53,6 +89,10 @@ def test_final_payload_has_literal_shell_expansion_and_complete_wireguard_bootst
     assert 'systemctl restart "${ssh_service}"' in payload
     assert 'systemctl is-active --quiet "${ssh_service}"' in payload
     assert "for candidate in ssh.service sshd.service; do" in payload
+    assert "systemctl daemon-reload" in payload
+    assert 'systemctl show --property=LoadState --value "${candidate}"' in payload
+    assert "systemctl cat" not in payload
+    assert "NEEDRESTART_MODE=l apt-get install -y iptables wireguard" in payload
     assert "$$" not in payload
     assert "$${ssh_service}" not in payload
     assert "@@" not in payload
@@ -74,16 +114,74 @@ def test_final_payload_has_literal_shell_expansion_and_complete_wireguard_bootst
 
 
 @pytest.mark.parametrize(
-    ("available", "expected"),
-    [({"ssh.service"}, "ssh.service"), ({"sshd.service"}, "sshd.service")],
+    ("load_states", "expected"),
+    [
+        ({"ssh.service": ["loaded"], "sshd.service": ["not-found"]}, "ssh.service"),
+        ({"ssh.service": ["not-found"], "sshd.service": ["loaded"]}, "sshd.service"),
+    ],
 )
-def test_final_rendered_payload_selects_the_available_ssh_unit(available: set[str], expected: str) -> None:
-    payload = rendered("aws-lightsail")
-    match = re.search(r"for candidate in ([^;]+); do", payload)
-    assert match
-    selected = next((candidate for candidate in match.group(1).split() if candidate in available), None)
+def test_final_rendered_payload_selects_loaded_ssh_unit(load_states: dict[str, list[str]], expected: str) -> None:
+    bootstrap = bootstrap_from_payload("aws-lightsail", rendered("aws-lightsail"))
+    selected, restarts, _probes, wireguard_entered, marker_created = simulate_ssh_phase(bootstrap, load_states)
     assert selected == expected
-    assert "neither ssh.service nor sshd.service is available" in payload
+    assert restarts == [expected]
+    assert wireguard_entered
+    assert marker_created
+
+
+def test_ssh_resolution_fails_before_wireguard_when_no_unit_is_loaded() -> None:
+    bootstrap = bootstrap_from_payload("aws-lightsail", rendered("aws-lightsail"))
+    selected, restarts, probes, wireguard_entered, marker_created = simulate_ssh_phase(
+        bootstrap,
+        {"ssh.service": ["not-found"], "sshd.service": ["not-found"]},
+    )
+    assert selected is None
+    assert restarts == []
+    assert probes == 10
+    assert not wireguard_entered
+    assert not marker_created
+    assert "ephemeral-vpn bootstrap: no loaded OpenSSH systemd service found" in bootstrap
+
+
+def test_ssh_resolution_retries_temporary_boot_visibility_without_nonexistent_fallback() -> None:
+    bootstrap = bootstrap_from_payload("aws-lightsail", rendered("aws-lightsail"))
+    selected, restarts, probes, wireguard_entered, marker_created = simulate_ssh_phase(
+        bootstrap,
+        {"ssh.service": ["not-found", "loaded"], "sshd.service": ["not-found"]},
+    )
+    assert selected == "ssh.service"
+    assert restarts == ["ssh.service"]
+    assert probes == 3
+    assert wireguard_entered
+    assert marker_created
+    assert "for attempt in 1 2 3 4 5; do" in bootstrap
+
+
+def test_selected_ssh_restart_failure_does_not_fall_back_or_reach_wireguard() -> None:
+    bootstrap = bootstrap_from_payload("aws-lightsail", rendered("aws-lightsail"))
+    selected, restarts, _probes, wireguard_entered, marker_created = simulate_ssh_phase(
+        bootstrap,
+        {"ssh.service": ["loaded"], "sshd.service": ["loaded"]},
+        restart_succeeds=False,
+    )
+    assert selected == "ssh.service"
+    assert restarts == ["ssh.service"]
+    assert not wireguard_entered
+    assert not marker_created
+    assert bootstrap.count('systemctl restart "${ssh_service}"') == 1
+
+
+@pytest.mark.parametrize("provider_id", ["aws-lightsail", "digitalocean", "scaleway"])
+def test_rendered_payload_has_one_portable_ssh_resolution_path(provider_id: str) -> None:
+    payload = rendered(provider_id)
+    bootstrap = bootstrap_from_payload(provider_id, payload)
+    validate_user_data_payload(provider_id, payload)
+    assert "resolve_ssh_service() {" in bootstrap
+    assert 'systemctl show --property=LoadState --value "${candidate}"' in bootstrap
+    assert bootstrap.count('systemctl restart "${ssh_service}"') == 1
+    assert not re.search(r"systemctl\s+restart\s+['\"]?(?:ssh|sshd)\.service", bootstrap)
+    assert "systemctl cat" not in bootstrap
+    assert "$$" not in bootstrap
 
 
 @pytest.mark.parametrize(

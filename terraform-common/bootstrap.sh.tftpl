@@ -10,7 +10,9 @@ rm -f "${READY_MARKER}"
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v wg >/dev/null || ! command -v wg-quick >/dev/null || ! command -v iptables >/dev/null; then
   apt-get update
-  apt-get install -y iptables wireguard
+  # Package hooks must not restart services using daemon-derived names such as
+  # sshd.service. SSH is validated and restarted explicitly below.
+  NEEDRESTART_MODE=l apt-get install -y iptables wireguard
 fi
 command -v systemctl >/dev/null
 command -v iptables >/dev/null
@@ -29,17 +31,37 @@ SSH_CONFIG
 chmod 0644 /etc/ssh/sshd_config.d/99-ephemeral-vpn.conf
 command -v sshd >/dev/null
 sshd -t
-ssh_service=""
-for candidate in ssh.service sshd.service; do
-  if systemctl cat "${candidate}" >/dev/null 2>&1; then
-    ssh_service="${candidate}"
-    break
-  fi
-done
-if [ -z "${ssh_service}" ]; then
-  echo "ephemeral-vpn bootstrap: neither ssh.service nor sshd.service is available" >&2
+
+# On-disk unit inspection can disagree with the running manager until
+# daemon-reload. Query the manager's LoadState instead.
+systemctl daemon-reload
+resolve_ssh_service() {
+  local attempt candidate load_state
+  for attempt in 1 2 3 4 5; do
+    for candidate in ssh.service sshd.service; do
+      load_state="$(systemctl show --property=LoadState --value "${candidate}" 2>/dev/null || true)"
+      if [ -z "${load_state}" ]; then
+        load_state="unknown"
+      fi
+      printf 'ephemeral-vpn ssh unit: attempt=%s unit=%s LoadState=%s\n' \
+        "${attempt}" "${candidate}" "${load_state}" >&2
+      if [ "${load_state}" = "loaded" ]; then
+        printf '%s\n' "${candidate}"
+        return 0
+      fi
+    done
+    if [ "${attempt}" -lt 5 ]; then
+      sleep 1
+    fi
+  done
+  return 1
+}
+
+if ! ssh_service="$(resolve_ssh_service)"; then
+  echo "ephemeral-vpn bootstrap: no loaded OpenSSH systemd service found" >&2
   exit 1
 fi
+echo "ephemeral-vpn ssh unit selected: ${ssh_service}"
 systemctl restart "${ssh_service}"
 systemctl is-active --quiet "${ssh_service}"
 

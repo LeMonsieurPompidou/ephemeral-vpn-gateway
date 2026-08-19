@@ -133,8 +133,15 @@ def _validate_bootstrap(bootstrap: str) -> None:
     if "$$" in bootstrap:
         raise UserDataValidationError("Bootstrap script contains PID-style dollar expansion")
     required = (
-        "apt-get install -y iptables wireguard",
+        "NEEDRESTART_MODE=l apt-get install -y iptables wireguard",
+        "systemctl daemon-reload",
+        "resolve_ssh_service() {",
+        "for attempt in 1 2 3 4 5; do",
         "for candidate in ssh.service sshd.service; do",
+        'systemctl show --property=LoadState --value "${candidate}"',
+        "ephemeral-vpn ssh unit: attempt=%s unit=%s LoadState=%s",
+        "ephemeral-vpn bootstrap: no loaded OpenSSH systemd service found",
+        "ephemeral-vpn ssh unit selected: ${ssh_service}",
         'systemctl restart "${ssh_service}"',
         "[Interface]",
         "ListenPort = ",
@@ -150,6 +157,12 @@ def _validate_bootstrap(bootstrap: str) -> None:
     )
     if not all(value in bootstrap for value in required):
         raise UserDataValidationError("Bootstrap script is missing a required provisioning invariant")
+    if "systemctl cat" in bootstrap:
+        raise UserDataValidationError("Bootstrap script uses nondeterministic unit-file probing")
+    if re.search(r"systemctl\s+restart\s+['\"]?(?:ssh|sshd)\.service", bootstrap):
+        raise UserDataValidationError("Bootstrap script contains a hardcoded OpenSSH service restart")
+    if bootstrap.count('systemctl restart "${ssh_service}"') != 1:
+        raise UserDataValidationError("Bootstrap script must contain exactly one resolved OpenSSH restart")
     phases = (
         'phase="prerequisite/package setup"',
         'phase="SSH hardening/configuration"',
@@ -163,7 +176,7 @@ def _validate_bootstrap(bootstrap: str) -> None:
         raise UserDataValidationError("Bootstrap provisioning phases are out of order")
     marker = bootstrap.index('touch "${READY_MARKER}"')
     prerequisites = (
-        bootstrap.index("apt-get install -y iptables wireguard"),
+        bootstrap.index("NEEDRESTART_MODE=l apt-get install -y iptables wireguard"),
         bootstrap.index('systemctl restart "${ssh_service}"'),
         bootstrap.index("wg-quick strip wg0"),
         bootstrap.index("sysctl --system"),
