@@ -166,6 +166,9 @@ def _validate_bootstrap(bootstrap: str) -> None:
         raise UserDataValidationError("Bootstrap script contains PID-style dollar expansion")
     required = (
         "BOOTSTRAP_BUILD=",
+        "STATUS_MARKER=/var/lib/ephemeral-vpn/bootstrap-status",
+        "record_bootstrap_status() {",
+        "build=%s\\nphase=%s\\nupdated_epoch=%s\\n",
         "ephemeral-vpn bootstrap build: ${BOOTSTRAP_BUILD}",
         "ephemeral-vpn bootstrap failure: phase=${phase} category=${command_category}",
         "NEEDRESTART_SUSPEND=1 apt-get install -y iptables wireguard",

@@ -4,6 +4,7 @@ umask 077
 
 READY_MARKER=/var/lib/ephemeral-vpn/ready
 FAILURE_MARKER=/var/lib/ephemeral-vpn/bootstrap-failure
+STATUS_MARKER=/var/lib/ephemeral-vpn/bootstrap-status
 BOOTSTRAP_BUILD=@@BOOTSTRAP_FINGERPRINT@@
 phase="prerequisite installation"
 command_category="bootstrap-initialization"
@@ -24,12 +25,23 @@ record_bootstrap_failure() {
   exit "${code}"
 }
 
+record_bootstrap_status() {
+  local temporary
+  temporary="${STATUS_MARKER}.tmp"
+  printf 'build=%s\nphase=%s\nupdated_epoch=%s\n' \
+    "${BOOTSTRAP_BUILD}" "${phase}" "$(date -u +%s)" > "${temporary}"
+  chmod 0644 "${temporary}"
+  mv -f "${temporary}" "${STATUS_MARKER}"
+}
+
 trap 'record_bootstrap_failure "$?" "$LINENO"' ERR
-echo "ephemeral-vpn bootstrap build: ${BOOTSTRAP_BUILD}"
-echo "ephemeral-vpn bootstrap phase: ${phase}"
 install -d -m 0755 /var/lib/ephemeral-vpn
 rm -f "${READY_MARKER}"
 rm -f "${FAILURE_MARKER}"
+rm -f "${STATUS_MARKER}"
+record_bootstrap_status
+echo "ephemeral-vpn bootstrap build: ${BOOTSTRAP_BUILD}"
+echo "ephemeral-vpn bootstrap phase: ${phase}"
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v wg >/dev/null || ! command -v wg-quick >/dev/null || ! command -v iptables >/dev/null; then
   echo "ephemeral-vpn bootstrap: refreshing package indexes"
@@ -65,6 +77,7 @@ command -v wg-quick >/dev/null
 
 phase="SSH hardening/configuration"
 command_category="ssh-configuration"
+record_bootstrap_status
 echo "ephemeral-vpn bootstrap phase: ${phase}"
 install -d -m 0755 /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/99-ephemeral-vpn.conf <<'SSH_CONFIG'
@@ -116,6 +129,7 @@ systemctl is-active --quiet "${ssh_service}"
 
 phase="WireGuard configuration"
 command_category="wireguard-configuration"
+record_bootstrap_status
 echo "ephemeral-vpn bootstrap phase: ${phase}"
 install -d -m 0700 /etc/wireguard
 cat > /etc/wireguard/wg0.conf <<'WG_CONFIG'
@@ -135,6 +149,7 @@ wg-quick strip wg0 >/dev/null
 
 phase="forwarding/NAT/sysctl"
 command_category="forwarding-nat-sysctl"
+record_bootstrap_status
 echo "ephemeral-vpn bootstrap phase: ${phase}"
 cat > /etc/sysctl.d/99-wireguard.conf <<'SYSCTL_CONFIG'
 net.ipv4.ip_forward=1
@@ -147,11 +162,13 @@ test -n "${OUTBOUND_IFACE}"
 
 phase="WireGuard service enable/start"
 command_category="wireguard-service-start"
+record_bootstrap_status
 echo "ephemeral-vpn bootstrap phase: ${phase}"
 systemctl enable --now wg-quick@wg0
 
 phase="final readiness validation"
 command_category="final-readiness-validation"
+record_bootstrap_status
 echo "ephemeral-vpn bootstrap phase: ${phase}"
 systemctl is-enabled --quiet wg-quick@wg0
 systemctl is-active --quiet wg-quick@wg0

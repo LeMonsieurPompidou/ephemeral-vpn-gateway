@@ -140,9 +140,25 @@ def test_final_payload_has_literal_shell_expansion_and_complete_wireguard_bootst
         "sysctl --system",
         "systemctl enable --now wg-quick@wg0",
         "/var/lib/ephemeral-vpn/ready",
+        "/var/lib/ephemeral-vpn/bootstrap-status",
+        "record_bootstrap_status",
+        "updated_epoch=%s",
     ):
         assert required in payload
     assert payload.index("systemctl is-active --quiet wg-quick@wg0") < payload.index('touch "${READY_MARKER}"')
+
+
+@pytest.mark.parametrize("provider_id", ["aws-lightsail", "digitalocean", "scaleway"])
+def test_safe_status_marker_tracks_shared_bootstrap_phases_without_secrets(provider_id: str) -> None:
+    bootstrap = bootstrap_from_payload(provider_id, rendered(provider_id))
+    assert bootstrap.count("record_bootstrap_status") == 7
+    status_function = bootstrap[
+        bootstrap.index("record_bootstrap_status() {") : bootstrap.index("trap 'record_bootstrap_failure")
+    ]
+    assert "build=%s\\nphase=%s\\nupdated_epoch=%s\\n" in status_function
+    assert "SERVER_PRIVATE_KEY" not in status_function
+    assert "CLIENT_PUBLIC_KEY" not in status_function
+    assert "PrivateKey" not in status_function
 
 
 @pytest.mark.parametrize("provider_id", ["aws-lightsail", "digitalocean", "scaleway"])

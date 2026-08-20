@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import subprocess
 import threading
 from pathlib import Path
 
@@ -121,6 +122,11 @@ def test_ssh_command_uses_explicit_deployment_identity(tmp_path: Path, monkeypat
     assert captured[captured.index("-i") + 1] == str(identity)
     assert "IdentitiesOnly=yes" in captured
     assert "PasswordAuthentication=no" in captured
+    assert "BatchMode=yes" in captured
+    assert "ConnectionAttempts=1" in captured
+    assert "ConnectTimeout=10" in captured
+    assert "ServerAliveInterval=5" in captured
+    assert "ServerAliveCountMax=2" in captured
     assert any(value.startswith("UserKnownHostsFile=") for value in captured)
 
 
@@ -431,6 +437,225 @@ def test_cloud_init_active_progress_hits_hard_maximum(tmp_path: Path, monkeypatc
             event,  # type: ignore[arg-type]
             overall_started=0,
         )
+
+
+def test_one_cloud_init_ssh_probe_timeout_recovers_and_finishes(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    clock = FakeClock()
+    event = AdvancingEvent(clock)
+    calls = 0
+
+    def run(args, cancel, *, timeout):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert timeout == orchestrator_module.SSH_PROCESS_TIMEOUT_SECONDS
+            clock.advance(timeout)
+            raise subprocess.TimeoutExpired(args, timeout)
+        if args[-1] == "cloud-init status --long":
+            return 0, "status: done", ""
+        return 0, _progress("final readiness validation", 2, ready=True), ""
+
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock)
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", run)
+    orchestrator._wait_for_cloud_init(
+        record,
+        Path("identity"),
+        Path("known-hosts"),
+        "ubuntu",
+        event,  # type: ignore[arg-type]
+        overall_started=0,
+    )
+    logs = Path(record.runtime_directory, "deployment.log").read_text(encoding="utf-8")
+    assert "SSH readiness probe temporarily timed out; retrying" in logs
+    assert "SSH readiness monitoring recovered" in logs
+    assert "identity" not in logs
+
+
+def test_ssh_service_restart_transport_outage_does_not_stall_cloud_init(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    clock = FakeClock()
+    event = AdvancingEvent(clock)
+    orchestrator.cloud_init_hard_timeout = 120
+    orchestrator.cloud_init_inactivity_timeout = 20
+    failures = 2
+    successful_polls = 0
+
+    def run(args, cancel, *, timeout):  # type: ignore[no-untyped-def]
+        nonlocal failures, successful_polls
+        if args[-1] == "cloud-init status --long" and failures:
+            failures -= 1
+            return 255, "", "Connection reset by peer"
+        if args[-1] == "cloud-init status --long":
+            successful_polls += 1
+            status = "done" if successful_polls == 3 else "running"
+            return 0, f"status: {status}", ""
+        return 0, _progress("prerequisite installation", 1), ""
+
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock)
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", run)
+    orchestrator._wait_for_cloud_init(
+        record,
+        Path("identity"),
+        Path("known-hosts"),
+        "ubuntu",
+        event,  # type: ignore[arg-type]
+        overall_started=0,
+    )
+    assert clock.value == 20
+
+
+def test_cloud_init_probe_outage_allowance_is_bounded_and_sanitized(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    clock = FakeClock()
+    event = AdvancingEvent(clock)
+    monkeypatch.setattr(orchestrator_module, "SSH_PROBE_OUTAGE_ALLOWANCE_SECONDS", 30.0)
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock)
+
+    def timeout(args, cancel, *, timeout):  # type: ignore[no-untyped-def]
+        clock.advance(timeout)
+        raise subprocess.TimeoutExpired(args, timeout)
+
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", timeout)
+    with pytest.raises(TerraformError) as raised:
+        orchestrator._wait_for_cloud_init(
+            record,
+            Path("C:/private/runtime/ssh.privatekey"),
+            Path("C:/private/runtime/known_hosts"),
+            "ubuntu",
+            event,  # type: ignore[arg-type]
+            overall_started=0,
+        )
+    message = str(raised.value)
+    assert "Server became unreachable during cloud initialization" in message
+    assert "ssh.privatekey" not in message
+    assert "known_hosts" not in message
+    logs = Path(record.runtime_directory, "deployment.log").read_text(encoding="utf-8")
+    assert "ssh.privatekey" not in logs
+    assert "Command ['ssh'" not in logs
+
+
+def test_cloud_init_hard_maximum_remains_absolute_during_ssh_outage(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    clock = FakeClock()
+    event = AdvancingEvent(clock)
+    orchestrator.cloud_init_hard_timeout = 20
+    orchestrator.cloud_init_inactivity_timeout = 10
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock)
+
+    def timeout(args, cancel, *, timeout):  # type: ignore[no-untyped-def]
+        clock.advance(timeout)
+        raise subprocess.TimeoutExpired(args, timeout)
+
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", timeout)
+    with pytest.raises(TerraformError, match="maximum provisioning time of 20s.*SSH monitoring"):
+        orchestrator._wait_for_cloud_init(
+            record,
+            Path("identity"),
+            Path("known-hosts"),
+            "ubuntu",
+            event,  # type: ignore[arg-type]
+            overall_started=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        ("Permission denied (publickey).", "SSH authentication failed"),
+        ("REMOTE HOST IDENTIFICATION HAS CHANGED!", "SSH host-key verification failed"),
+        ("ssh: connect to host 203.0.113.10 port 22: Connection timed out", "SSH connection timed out"),
+        ("remote probe failed", "Remote SSH readiness command failed (exit 7)"),
+    ],
+)
+def test_fatal_ssh_probe_errors_are_typed_and_hide_argv(
+    tmp_path: Path, monkeypatch, stderr: str, expected: str
+) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    secret_path = Path("C:/secret runtime/ssh.privatekey")
+    args = orchestrator._ssh_command(secret_path, Path("C:/secret runtime/known_hosts"), "ubuntu", "203.0.113.10", "x")
+    returncode = 255 if "remote probe" not in stderr else 7
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_cancellable_process",
+        lambda *unused, **kwargs: (returncode, "", stderr),
+    )
+    with pytest.raises(Exception) as raised:
+        orchestrator._run_ssh_probe(args, threading.Event(), allowed_returncodes={0})
+    message = str(raised.value)
+    assert expected in message
+    assert "ssh.privatekey" not in message
+    assert "known_hosts" not in message
+
+
+def test_cloud_init_progress_probe_prefers_small_status_marker() -> None:
+    command = orchestrator_module.CLOUD_INIT_PROGRESS_COMMAND
+    assert "bootstrap-status" in command
+    assert 'cat "$status"' in command
+    assert "stat -c 'activity_epoch=%Y' \"$output\"" in command
+    assert command.index('cat "$status"') < command.index("sed -n")
+
+
+def test_cloud_init_progress_accepts_status_marker_timestamp() -> None:
+    progress = orchestrator_module.Orchestrator._cloud_init_progress(
+        "build=0123456789ab\nphase=SSH hardening/configuration\nupdated_epoch=1770000000\nready=0\n"
+    )
+    assert progress.phase == "SSH hardening/configuration"
+    assert progress.activity_epoch == 1770000000
+
+
+def test_health_checks_reach_wireguard_after_temporary_monitor_timeout(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    identity = Path(record.runtime_directory, "ssh.privatekey")
+    identity.write_text("private", encoding="utf-8")
+    clock = FakeClock()
+    event = AdvancingEvent(clock)
+    cloud_status_calls = 0
+
+    class Connection:
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return None
+
+    def run(args, cancel, *, timeout):  # type: ignore[no-untyped-def]
+        nonlocal cloud_status_calls
+        command = args[-1]
+        if command == "true":
+            return 0, "", ""
+        if command == "cloud-init status --long":
+            cloud_status_calls += 1
+            if cloud_status_calls == 1:
+                clock.advance(timeout)
+                raise subprocess.TimeoutExpired(args, timeout)
+            return 0, "status: done", ""
+        if command == orchestrator_module.CLOUD_INIT_PROGRESS_COMMAND:
+            return 0, _progress("final readiness validation", 2, ready=True), ""
+        return 0, "", ""
+
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: Connection())
+    monkeypatch.setattr(orchestrator_module, "verify_private_file", lambda path: None)
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock)
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", run)
+    orchestrator._ssh_health_checks(
+        record,
+        DeploymentOptions(ssh_cidr="8.8.8.8/32"),
+        event,  # type: ignore[arg-type]
+        automatic_ssh_cidr=False,
+    )
+    assert record.state.value == "checking_wireguard"
+    assert record.bootstrap_phase == "final readiness validation"
 
 
 def test_ssh_and_wireguard_have_separate_timeouts(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

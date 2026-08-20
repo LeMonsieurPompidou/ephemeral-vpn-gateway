@@ -35,6 +35,7 @@ from security import (
     write_secret,
     write_secret_bytes,
 )
+from ssh_probe import SshProbeError, SshProbeTimeout, SshTransientError, SshTransportFailure, classify_ssh_failure
 from terraform_runner import CommandResult, TerraformCancelled, TerraformError, TerraformRunner
 from validation import validate_options
 
@@ -51,13 +52,22 @@ CLOUD_INIT_INACTIVITY_TIMEOUT_SECONDS = 180.0
 WIREGUARD_READINESS_TIMEOUT_SECONDS = 120.0
 READINESS_POLL_INTERVAL_SECONDS = 5.0
 CLOUD_INIT_PROGRESS_LOG_INTERVAL_SECONDS = 30.0
+SSH_CONNECT_TIMEOUT_SECONDS = 10
+SSH_SERVER_ALIVE_INTERVAL_SECONDS = 5
+SSH_SERVER_ALIVE_COUNT_MAX = 2
+SSH_PROCESS_TIMEOUT_SECONDS = 25.0
+SSH_PROBE_OUTAGE_ALLOWANCE_SECONDS = 90.0
 CLOUD_INIT_PROGRESS_COMMAND = (
+    "status=/var/lib/ephemeral-vpn/bootstrap-status; "
     "output=/var/log/cloud-init-output.log; "
-    'if [ -r "$output" ]; then '
+    'if [ -r "$status" ]; then cat "$status"; '
+    'elif [ -r "$output" ]; then '
     "sed -n 's/^ephemeral-vpn bootstrap phase: \\([A-Za-z0-9 /_-]\\{1,80\\}\\)$/phase=\\1/p' "
     '"$output" | tail -n 1; '
     "sed -n 's/^ephemeral-vpn bootstrap build: \\([0-9a-f]\\{12\\}\\)$/build=\\1/p' "
     '"$output" | tail -n 1; '
+    "fi; "
+    'if [ -r "$output" ]; then '
     "stat -c 'activity_epoch=%Y' \"$output\"; "
     "stat -c 'activity_size=%s' \"$output\"; "
     "fi; "
@@ -524,15 +534,17 @@ class Orchestrator:
                 with socket.create_connection((record.public_ip, 22), timeout=3):
                     pass
                 args = self._ssh_command(identity, known_hosts, user, record.public_ip, "true")
-                returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=20)
-                if returncode == 0:
-                    self._persist_provisioning_elapsed(record, overall_started)
-                    return
-                last_error = redact((stderr or stdout).strip())[-500:] or f"SSH exited {returncode}"
+                self._run_ssh_probe(args, cancel, allowed_returncodes={0})
+                self._persist_provisioning_elapsed(record, overall_started)
+                return
             except TerraformCancelled:
                 raise
-            except (OSError, subprocess.SubprocessError) as exc:
-                last_error = redact(str(exc))
+            except SshProbeError as exc:
+                if not isinstance(exc, SshTransientError):
+                    raise TerraformError(f"{exc} Cloud resources may exist and must be destroyed.") from exc
+                last_error = str(exc)
+            except OSError:
+                last_error = "SSH transport is not ready."
 
             if automatic_ssh_cidr and not ip_refresh_attempted and attempts >= 3:
                 ip_refresh_attempted = True
@@ -565,48 +577,128 @@ class Orchestrator:
         last_progress = started
         last_log = started - CLOUD_INIT_PROGRESS_LOG_INTERVAL_SECONDS
         last_token: tuple[str | None, int | None, int | None] | None = None
+        probe_outage_started: float | None = None
+        probe_failures = 0
         expected_build = self._expected_bootstrap_build(record)
         while True:
             self._raise_if_cancelled(cancel)
-            args = self._ssh_command(identity, known_hosts, user, record.public_ip, "cloud-init status --long")
-            returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=20)
-            combined = (stdout + "\n" + stderr).strip()
-            status = self._cloud_init_status(returncode, combined)
-            if status == "error":
-                failure_args = self._ssh_command(
-                    identity,
-                    known_hosts,
-                    user,
-                    record.public_ip,
-                    f"if [ -r {FAILURE_MARKER} ]; then cat {FAILURE_MARKER}; fi",
+            poll_started = time.monotonic()
+            try:
+                args = self._ssh_command(identity, known_hosts, user, record.public_ip, "cloud-init status --long")
+                returncode, stdout, stderr = self._run_ssh_probe(
+                    args,
+                    cancel,
+                    allowed_returncodes={0, 1, 2},
+                    timeout=self._cloud_init_probe_timeout(started, probe_outage_started),
                 )
-                _failure_code, failure_stdout, failure_stderr = self._run_cancellable_process(
-                    failure_args, cancel, timeout=20
-                )
-                diagnostic = self._cloud_init_failure_diagnostic("\n".join((combined, failure_stdout, failure_stderr)))
-                if diagnostic:
-                    raise TerraformError(
-                        f"Cloud initialization failed during {diagnostic}. "
-                        "Cloud resources may exist and must be destroyed."
+                combined = (stdout + "\n" + stderr).strip()
+                status = self._cloud_init_status(returncode, combined)
+                if status == "error":
+                    failure_args = self._ssh_command(
+                        identity,
+                        known_hosts,
+                        user,
+                        record.public_ip,
+                        f"if [ -r {FAILURE_MARKER} ]; then cat {FAILURE_MARKER}; fi",
                     )
-                raise TerraformError(
-                    "Cloud initialization failed during bootstrap. Cloud resources may exist and must be destroyed."
-                )
+                    try:
+                        _failure_code, failure_stdout, failure_stderr = self._run_ssh_probe(
+                            failure_args,
+                            cancel,
+                            allowed_returncodes={0},
+                            timeout=self._cloud_init_probe_timeout(started, probe_outage_started),
+                        )
+                    except SshProbeError:
+                        failure_stdout = failure_stderr = ""
+                    diagnostic = self._cloud_init_failure_diagnostic(
+                        "\n".join((combined, failure_stdout, failure_stderr))
+                    )
+                    if diagnostic:
+                        raise TerraformError(
+                            f"Cloud initialization failed during {diagnostic}. "
+                            "Cloud resources may exist and must be destroyed."
+                        )
+                    raise TerraformError(
+                        "Cloud initialization failed during bootstrap. Cloud resources may exist and must be destroyed."
+                    )
 
-            progress_args = self._ssh_command(
-                identity, known_hosts, user, record.public_ip, CLOUD_INIT_PROGRESS_COMMAND
-            )
-            progress_code, progress_stdout, _progress_stderr = self._run_cancellable_process(
-                progress_args, cancel, timeout=20
-            )
-            progress = self._cloud_init_progress(progress_stdout if progress_code == 0 else "")
+                progress_args = self._ssh_command(
+                    identity, known_hosts, user, record.public_ip, CLOUD_INIT_PROGRESS_COMMAND
+                )
+                _progress_code, progress_stdout, _progress_stderr = self._run_ssh_probe(
+                    progress_args,
+                    cancel,
+                    allowed_returncodes={0},
+                    timeout=self._cloud_init_probe_timeout(started, probe_outage_started),
+                )
+            except TerraformCancelled:
+                raise
+            except SshTransientError as exc:
+                now = time.monotonic()
+                if probe_outage_started is None:
+                    probe_outage_started = poll_started
+                    probe_failures = 0
+                probe_failures += 1
+                elapsed = now - started
+                outage = now - probe_outage_started
+                self._persist_provisioning_elapsed(record, overall_started)
+                if elapsed >= self.cloud_init_hard_timeout:
+                    raise TerraformError(
+                        f"Cloud initialization exceeded the maximum provisioning time of "
+                        f"{self._duration_text(self.cloud_init_hard_timeout)} while SSH monitoring was unavailable. "
+                        "Cloud resources may exist and must be destroyed."
+                    ) from exc
+                if outage >= SSH_PROBE_OUTAGE_ALLOWANCE_SECONDS:
+                    raise TerraformError(
+                        "Server became unreachable during cloud initialization for "
+                        f"{self._duration_text(outage)}. Cloud resources may exist and must be destroyed."
+                    ) from exc
+                probe_description = (
+                    "temporarily timed out" if isinstance(exc, SshProbeTimeout) else "is temporarily unavailable"
+                )
+                self._log(
+                    record.id,
+                    f"SSH readiness probe {probe_description}; retrying "
+                    f"({probe_failures}, outage {self._duration_text(outage)}/"
+                    f"{self._duration_text(SSH_PROBE_OUTAGE_ALLOWANCE_SECONDS)})",
+                )
+                if cancel.wait(self.readiness_poll_interval):
+                    raise TerraformCancelled("Deployment cancelled while waiting for cloud initialization") from exc
+                continue
+            except SshProbeError as exc:
+                raise TerraformError(f"{exc} Cloud resources may exist and must be destroyed.") from exc
+
+            now = time.monotonic()
+            elapsed = now - started
+            if elapsed > self.cloud_init_hard_timeout:
+                raise TerraformError(
+                    "Cloud initialization is progressing but exceeded the maximum provisioning time of "
+                    f"{self._duration_text(self.cloud_init_hard_timeout)}. "
+                    "Cloud resources may exist and must be destroyed."
+                )
+            if probe_outage_started is not None:
+                outage = now - probe_outage_started
+                if outage > SSH_PROBE_OUTAGE_ALLOWANCE_SECONDS:
+                    raise TerraformError(
+                        "Server became unreachable during cloud initialization for "
+                        f"{self._duration_text(outage)}. Cloud resources may exist and must be destroyed."
+                    )
+                last_progress += outage
+                self._log(
+                    record.id,
+                    f"SSH readiness monitoring recovered after {self._duration_text(outage)}; "
+                    "cloud-init monitoring continues",
+                )
+                probe_outage_started = None
+                probe_failures = 0
+
+            progress = self._cloud_init_progress(progress_stdout)
             if expected_build and progress.build and progress.build != expected_build:
                 raise TerraformError(
                     "Remote bootstrap build fingerprint differs from the deployment runtime manifest; "
                     "cloud resources may exist and must be destroyed."
                 )
 
-            now = time.monotonic()
             meaningful_progress = any(value is not None for value in progress.token)
             changed = meaningful_progress and progress.token != last_token
             previous_phase = record.bootstrap_phase
@@ -619,7 +711,6 @@ class Orchestrator:
             elif not record.bootstrap_phase:
                 record.bootstrap_phase = "cloud-init startup"
             phase_changed = record.bootstrap_phase != previous_phase
-            elapsed = now - started
             inactivity = now - last_progress
             self._persist_provisioning_elapsed(record, overall_started)
 
@@ -682,15 +773,17 @@ class Orchestrator:
             self._raise_if_cancelled(cancel)
             try:
                 args = self._ssh_command(identity, known_hosts, user, record.public_ip, wireguard_check)
-                returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=20)
+                returncode, stdout, stderr = self._run_ssh_probe(args, cancel, allowed_returncodes={0, 1})
                 if returncode == 0:
                     self._persist_provisioning_elapsed(record, overall_started)
                     return
                 last_error = redact((stderr or stdout).strip())[-500:] or "WireGuard readiness check failed"
             except TerraformCancelled:
                 raise
-            except (OSError, subprocess.SubprocessError) as exc:
-                last_error = redact(str(exc))
+            except SshProbeError as exc:
+                if not isinstance(exc, SshTransientError):
+                    raise TerraformError(f"{exc} Cloud resources may exist and must be destroyed.") from exc
+                last_error = str(exc)
             elapsed = time.monotonic() - started
             self._persist_provisioning_elapsed(record, overall_started)
             if elapsed >= self.wireguard_readiness_timeout:
@@ -718,7 +811,7 @@ class Orchestrator:
     def _cloud_init_progress(output: str) -> CloudInitProgress:
         phase_match = re.search(r"(?m)^phase=([A-Za-z0-9 /_-]{1,80})$", output)
         build_match = re.search(r"(?m)^build=([0-9a-f]{12})$", output, flags=re.IGNORECASE)
-        epoch_match = re.search(r"(?m)^activity_epoch=([0-9]{1,12})$", output)
+        epoch_match = re.search(r"(?m)^(?:activity|updated)_epoch=([0-9]{1,12})$", output)
         size_match = re.search(r"(?m)^activity_size=([0-9]{1,12})$", output)
         return CloudInitProgress(
             phase_match.group(1).strip() if phase_match else None,
@@ -747,7 +840,15 @@ class Orchestrator:
             "-o",
             "KbdInteractiveAuthentication=no",
             "-o",
-            "ConnectTimeout=10",
+            "BatchMode=yes",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            f"ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}",
+            "-o",
+            f"ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL_SECONDS}",
+            "-o",
+            f"ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}",
             "-o",
             "StrictHostKeyChecking=accept-new",
             "-o",
@@ -755,6 +856,46 @@ class Orchestrator:
             f"{user}@{public_ip}",
             remote_command,
         ]
+
+    def _run_ssh_probe(
+        self,
+        args: list[str],
+        cancel: threading.Event,
+        *,
+        allowed_returncodes: set[int],
+        timeout: float = SSH_PROCESS_TIMEOUT_SECONDS,
+    ) -> tuple[int, str, str]:
+        try:
+            returncode, stdout, stderr = self._run_cancellable_process(args, cancel, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise SshProbeTimeout("Temporary SSH readiness probe timeout.") from exc
+        except OSError as exc:
+            raise SshTransportFailure("SSH transport is temporarily unavailable.") from exc
+        if returncode not in allowed_returncodes:
+            raise classify_ssh_failure(returncode, "\n".join((stdout, stderr)))
+        return returncode, stdout, stderr
+
+    def _cloud_init_probe_timeout(self, started: float, outage_started: float | None) -> float:
+        now = time.monotonic()
+        hard_remaining = self.cloud_init_hard_timeout - (now - started)
+        if hard_remaining <= 0:
+            context = " while SSH monitoring was unavailable" if outage_started is not None else ""
+            raise TerraformError(
+                "Cloud initialization is progressing but exceeded the maximum provisioning time of "
+                f"{self._duration_text(self.cloud_init_hard_timeout)}{context}. "
+                "Cloud resources may exist and must be destroyed."
+            )
+        timeout = min(SSH_PROCESS_TIMEOUT_SECONDS, hard_remaining)
+        if outage_started is not None:
+            outage_remaining = SSH_PROBE_OUTAGE_ALLOWANCE_SECONDS - (now - outage_started)
+            if outage_remaining <= 0:
+                raise TerraformError(
+                    "Server became unreachable during cloud initialization for "
+                    f"{self._duration_text(SSH_PROBE_OUTAGE_ALLOWANCE_SECONDS)}. "
+                    "Cloud resources may exist and must be destroyed."
+                )
+            timeout = min(timeout, outage_remaining)
+        return timeout
 
     @staticmethod
     def _cloud_init_status(returncode: int, output: str) -> str:
