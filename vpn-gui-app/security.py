@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import csv
+import hashlib
+import hmac
 import os
 import re
 import stat
@@ -11,7 +14,13 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+    load_ssh_private_key,
+)
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(token|secret|private[_ -]?key|password)(\s*[=:]\s*)([^\s,;]+)"),
@@ -27,6 +36,10 @@ _PROTECTED_FILES_LOCK = threading.Lock()
 
 class PrivateFileSecurityError(RuntimeError):
     """Raised when a private file cannot be restricted to the current user."""
+
+
+class SshIdentityError(RuntimeError):
+    """Raised when deployment SSH identity artifacts do not form one keypair."""
 
 
 _SET_WINDOWS_ACL = r"""
@@ -100,6 +113,36 @@ def generate_ssh_keypair() -> tuple[str, str]:
     private_text = private.private_bytes(Encoding.PEM, PrivateFormat.OpenSSH, NoEncryption()).decode("ascii")
     public_text = private.public_key().public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH).decode("ascii")
     return private_text, public_text
+
+
+def ssh_public_key_fingerprint(public_text: str) -> str:
+    """Return an OpenSSH SHA-256 fingerprint without retaining key comments."""
+    parts = public_text.strip().split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise SshIdentityError("SSH public key is malformed or is not Ed25519")
+    try:
+        key_blob = base64.b64decode(parts[1], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise SshIdentityError("SSH public key is malformed") from exc
+    digest = base64.b64encode(hashlib.sha256(key_blob).digest()).decode("ascii").rstrip("=")
+    return f"SHA256:{digest}"
+
+
+def verify_ssh_keypair(private_path: Path, public_path: Path) -> str:
+    """Verify deployment private/public files are the same Ed25519 identity."""
+    try:
+        private_key = load_ssh_private_key(private_path.read_bytes(), password=None)
+        public_text = public_path.read_text(encoding="ascii").strip()
+    except (OSError, TypeError, UnicodeError, ValueError) as exc:
+        raise SshIdentityError("Deployment SSH identity files are missing or malformed") from exc
+    if not isinstance(private_key, Ed25519PrivateKey):
+        raise SshIdentityError("Deployment SSH private key is not Ed25519")
+    derived = private_key.public_key().public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH).decode("ascii")
+    supplied_parts = public_text.split()
+    supplied = " ".join(supplied_parts[:2]) if len(supplied_parts) >= 2 else public_text
+    if not hmac.compare_digest(derived, supplied):
+        raise SshIdentityError("Deployment SSH private and public keys do not match")
+    return ssh_public_key_fingerprint(derived)
 
 
 def _platform_is_windows() -> bool:

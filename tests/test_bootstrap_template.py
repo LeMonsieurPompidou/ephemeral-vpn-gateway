@@ -162,6 +162,16 @@ def test_safe_status_marker_tracks_shared_bootstrap_phases_without_secrets(provi
 
 
 @pytest.mark.parametrize("provider_id", ["aws-lightsail", "digitalocean", "scaleway"])
+def test_bootstrap_preserves_provider_managed_ssh_authorization(provider_id: str) -> None:
+    bootstrap = bootstrap_from_payload(provider_id, rendered(provider_id))
+    assert "TrustedUserCAKeys" not in bootstrap
+    assert "AuthorizedKeysFile" not in bootstrap
+    assert "authorized_keys" not in bootstrap
+    assert "lightsail_instance_ca" not in bootstrap
+    assert "/home/ubuntu/.ssh" not in bootstrap
+
+
+@pytest.mark.parametrize("provider_id", ["aws-lightsail", "digitalocean", "scaleway"])
 def test_needrestart_hook_is_suspended_at_the_shared_package_boundary(provider_id: str) -> None:
     bootstrap = bootstrap_from_payload(provider_id, rendered(provider_id))
     hidden_restart, ssh_entered, marker_created = simulate_prerequisite_phase(

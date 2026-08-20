@@ -7,12 +7,42 @@ from types import SimpleNamespace
 
 import pytest
 import security
-from security import PrivateFileSecurityError, generate_wireguard_keypair, redact, verify_private_file, write_secret
+from security import (
+    PrivateFileSecurityError,
+    SshIdentityError,
+    generate_ssh_keypair,
+    generate_wireguard_keypair,
+    redact,
+    ssh_public_key_fingerprint,
+    verify_private_file,
+    verify_ssh_keypair,
+    write_secret,
+)
 
 
 def test_wireguard_keypair_is_base64_and_distinct() -> None:
     private, public = generate_wireguard_keypair()
     assert len(private) == 44 and len(public) == 44 and private != public
+
+
+def test_ssh_private_public_files_match_one_fingerprint(tmp_path: Path) -> None:
+    private, public = generate_ssh_keypair()
+    private_path = tmp_path / "ssh.privatekey"
+    public_path = tmp_path / "ssh.publickey"
+    private_path.write_text(private, encoding="ascii")
+    public_path.write_text(public + " deployment-comment\n", encoding="ascii")
+    assert verify_ssh_keypair(private_path, public_path) == ssh_public_key_fingerprint(public)
+
+
+def test_ssh_keypair_verification_rejects_another_deployment_identity(tmp_path: Path) -> None:
+    private, _public = generate_ssh_keypair()
+    _other_private, other_public = generate_ssh_keypair()
+    private_path = tmp_path / "ssh.privatekey"
+    public_path = tmp_path / "ssh.publickey"
+    private_path.write_text(private, encoding="ascii")
+    public_path.write_text(other_public, encoding="ascii")
+    with pytest.raises(SshIdentityError, match="do not match"):
+        verify_ssh_keypair(private_path, public_path)
 
 
 def test_redaction_removes_tokens_and_private_keys() -> None:

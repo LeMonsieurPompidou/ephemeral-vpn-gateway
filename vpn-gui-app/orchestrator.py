@@ -27,15 +27,24 @@ from providers import ProviderRegistry
 from runtime_registry import DeploymentRegistry
 from security import (
     PrivateFileSecurityError,
+    SshIdentityError,
     append_redacted_log,
     generate_ssh_keypair,
     generate_wireguard_keypair,
     redact,
     verify_private_file,
+    verify_ssh_keypair,
     write_secret,
     write_secret_bytes,
 )
-from ssh_probe import SshProbeError, SshProbeTimeout, SshTransientError, SshTransportFailure, classify_ssh_failure
+from ssh_probe import (
+    SshAuthenticationFailure,
+    SshProbeError,
+    SshProbeTimeout,
+    SshTransientError,
+    SshTransportFailure,
+    classify_ssh_failure,
+)
 from terraform_runner import CommandResult, TerraformCancelled, TerraformError, TerraformRunner
 from validation import validate_options
 
@@ -469,6 +478,10 @@ class Orchestrator:
             verify_private_file(identity)
         except PrivateFileSecurityError as exc:
             raise TerraformError(f"Local SSH private-key security check failed: {exc}") from exc
+        try:
+            verify_ssh_keypair(identity, runtime / "ssh.publickey")
+        except SshIdentityError as exc:
+            raise TerraformError(f"Local SSH deployment identity check failed: {exc}") from exc
         overall_started = time.monotonic()
         record.readiness_started_at = record.readiness_started_at or now_iso()
         record.provisioning_elapsed_seconds = 0
@@ -761,13 +774,15 @@ class Orchestrator:
         started = time.monotonic()
         last_error = "WireGuard is not ready"
         wireguard_check = (
-            f"test -f {readiness_marker} && "
-            "systemctl is-enabled --quiet wg-quick@wg0 && "
-            "systemctl is-active --quiet wg-quick@wg0 && "
-            "ip link show wg0 >/dev/null && "
-            'test "$(sysctl -n net.ipv4.ip_forward)" = 1 && '
-            "iptables -t nat -C POSTROUTING -j MASQUERADE && "
-            f"ss -H -lun 'sport = :{options.wireguard_port}' | grep -q ."
+            f"if ! test -f {readiness_marker}; then echo readiness=marker-missing; exit 1; fi; "
+            "if ! systemctl is-active --quiet wg-quick@wg0; "
+            "then echo readiness=service-inactive; exit 1; fi; "
+            "if ! ip link show wg0 >/dev/null; then echo readiness=interface-missing; exit 1; fi; "
+            'if ! test "$(sysctl -n net.ipv4.ip_forward)" = 1; '
+            "then echo readiness=forwarding-disabled; exit 1; fi; "
+            f"if ! ss -H -lun 'sport = :{options.wireguard_port}' | grep -q .; "
+            "then echo readiness=udp-listener-missing; exit 1; fi; "
+            "echo readiness=ready"
         )
         while True:
             self._raise_if_cancelled(cancel)
@@ -782,6 +797,11 @@ class Orchestrator:
                 raise
             except SshProbeError as exc:
                 if not isinstance(exc, SshTransientError):
+                    if isinstance(exc, SshAuthenticationFailure):
+                        raise TerraformError(
+                            "Deployment SSH identity rejected after bootstrap. "
+                            "Cloud resources may exist and must be destroyed."
+                        ) from exc
                     raise TerraformError(f"{exc} Cloud resources may exist and must be destroyed.") from exc
                 last_error = str(exc)
             elapsed = time.monotonic() - started
@@ -1648,6 +1668,8 @@ class Orchestrator:
         state = Path(record.state_path).resolve()
         if directory != self._provider_directory(record.provider_id):
             raise TerraformError("Recorded Terraform source directory is unsafe or inconsistent")
+        if runtime != (self.runtime_root / record.id).resolve():
+            raise TerraformError("Deployment runtime identity differs from its registry ID")
         self._assert_scoped_path(runtime, state)
 
     def _assert_scoped_path(self, runtime: Path, state: Path) -> None:

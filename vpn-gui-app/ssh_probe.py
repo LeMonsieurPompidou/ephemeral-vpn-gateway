@@ -49,12 +49,12 @@ _CONNECT_TIMEOUT = re.compile(r"connection timed out|operation timed out", flags
 
 def classify_ssh_failure(returncode: int, output: str) -> SshProbeError:
     """Classify an SSH failure without retaining argv, paths, or remote commands."""
+    if returncode != 255:
+        return SshRemoteCommandFailure(f"Remote SSH readiness command failed (exit {returncode}).")
     if _AUTH_FAILURE.search(output):
         return SshAuthenticationFailure("SSH authentication failed for the deployment identity.")
     if _HOST_KEY_FAILURE.search(output):
         return SshHostKeyFailure("SSH host-key verification failed for the deployment server.")
     if _CONNECT_TIMEOUT.search(output):
         return SshConnectTimeout("SSH connection timed out.")
-    if returncode == 255:
-        return SshTransportFailure("SSH transport is temporarily unavailable.")
-    return SshRemoteCommandFailure(f"Remote SSH readiness command failed (exit {returncode}).")
+    return SshTransportFailure("SSH transport is temporarily unavailable.")

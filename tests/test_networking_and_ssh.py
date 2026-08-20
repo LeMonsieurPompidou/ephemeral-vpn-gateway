@@ -11,7 +11,7 @@ import pytest
 from helpers import add_record, make_orchestrator
 from models import DeploymentOptions
 from networking import PublicIpDetectionError, detect_public_ipv4, normalize_public_ipv4_cidr
-from security import PrivateFileSecurityError
+from security import PrivateFileSecurityError, SshIdentityError
 from terraform_runner import TerraformError
 
 
@@ -68,6 +68,11 @@ class CloudSequence:
             self.poll += 1
             return 0, value, ""
         raise AssertionError(f"Unexpected SSH command: {command}")
+
+
+@pytest.fixture(autouse=True)
+def valid_test_ssh_identity(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(orchestrator_module, "verify_ssh_keypair", lambda private, public: "SHA256:test")
 
 
 def test_public_ipv4_detection_and_normalization(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -596,6 +601,28 @@ def test_fatal_ssh_probe_errors_are_typed_and_hide_argv(
     assert "known_hosts" not in message
 
 
+def test_remote_permission_denied_is_not_misclassified_as_ssh_authentication(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    args = orchestrator._ssh_command(
+        Path("C:/secret runtime/ssh.privatekey"),
+        Path("C:/secret runtime/known_hosts"),
+        "ubuntu",
+        "203.0.113.10",
+        "readiness-check",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_cancellable_process",
+        lambda *unused, **kwargs: (4, "", "iptables: Permission denied (you must be root)"),
+    )
+    with pytest.raises(Exception) as raised:
+        orchestrator._run_ssh_probe(args, threading.Event(), allowed_returncodes={0, 1})
+    message = str(raised.value)
+    assert message == "Remote SSH readiness command failed (exit 4)."
+    assert "authentication" not in message.lower()
+    assert "ssh.privatekey" not in message
+
+
 def test_cloud_init_progress_probe_prefers_small_status_marker() -> None:
     command = orchestrator_module.CLOUD_INIT_PROGRESS_COMMAND
     assert "bootstrap-status" in command
@@ -656,6 +683,93 @@ def test_health_checks_reach_wireguard_after_temporary_monitor_timeout(tmp_path:
     )
     assert record.state.value == "checking_wireguard"
     assert record.bootstrap_phase == "final readiness validation"
+
+
+def test_wireguard_readiness_is_unprivileged_and_marker_bound(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    captured: list[str] = []
+
+    def run(args, cancel, *, timeout):  # type: ignore[no-untyped-def]
+        captured.append(args[-1])
+        return 0, "readiness=ready", ""
+
+    monkeypatch.setattr(orchestrator, "_run_cancellable_process", run)
+    orchestrator._wait_for_wireguard(
+        record,
+        Path("identity"),
+        Path("known-hosts"),
+        "ubuntu",
+        DeploymentOptions(ssh_cidr="8.8.8.8/32"),
+        threading.Event(),
+        readiness_marker="/var/lib/ephemeral-vpn/ready",
+        overall_started=0,
+    )
+    command = captured[0]
+    assert "test -f /var/lib/ephemeral-vpn/ready" in command
+    assert "systemctl is-active --quiet wg-quick@wg0" in command
+    assert "ip link show wg0" in command
+    assert "readiness=ready" in command
+    assert "iptables" not in command
+    assert "sudo" not in command
+    assert "systemctl is-enabled" not in command
+
+
+def test_persistent_post_bootstrap_authentication_rejection_is_fatal_and_sanitized(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_cancellable_process",
+        lambda *unused, **kwargs: (255, "", "Permission denied (publickey)."),
+    )
+    with pytest.raises(TerraformError) as raised:
+        orchestrator._wait_for_wireguard(
+            record,
+            Path("C:/private runtime/ssh.privatekey"),
+            Path("C:/private runtime/known_hosts"),
+            "ubuntu",
+            DeploymentOptions(ssh_cidr="8.8.8.8/32"),
+            threading.Event(),
+            readiness_marker="/var/lib/ephemeral-vpn/ready",
+            overall_started=0,
+        )
+    message = str(raised.value)
+    assert "Deployment SSH identity rejected after bootstrap" in message
+    assert "ssh.privatekey" not in message
+    assert "known_hosts" not in message
+
+
+def test_mismatched_local_ssh_identity_fails_before_networking(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    record = add_record(orchestrator, "aws-lightsail")
+    record.public_ip = "203.0.113.10"
+    Path(record.runtime_directory, "ssh.privatekey").write_text("private", encoding="utf-8")
+    Path(record.runtime_directory, "ssh.publickey").write_text("public", encoding="utf-8")
+    network_attempted = False
+
+    def invalid(private: Path, public: Path) -> str:
+        raise SshIdentityError("Deployment SSH private and public keys do not match")
+
+    def connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal network_attempted
+        network_attempted = True
+        raise AssertionError("network must not be reached")
+
+    monkeypatch.setattr(orchestrator_module, "verify_private_file", lambda path: None)
+    monkeypatch.setattr(orchestrator_module, "verify_ssh_keypair", invalid)
+    monkeypatch.setattr(socket, "create_connection", connect)
+    with pytest.raises(TerraformError, match="Local SSH deployment identity check failed") as raised:
+        orchestrator._ssh_health_checks(
+            record,
+            DeploymentOptions(ssh_cidr="8.8.8.8/32"),
+            threading.Event(),
+            automatic_ssh_cidr=False,
+        )
+    assert "ssh.privatekey" not in str(raised.value)
+    assert not network_attempted
 
 
 def test_ssh_and_wireguard_have_separate_timeouts(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

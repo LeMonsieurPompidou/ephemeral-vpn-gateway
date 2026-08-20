@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import orchestrator as orchestrator_module
 import pytest
 from helpers import FakeTerraformRunner, add_record, legacy_state, make_orchestrator
 from models import DeploymentOptions, DeploymentState
+from security import generate_ssh_keypair, ssh_public_key_fingerprint, verify_ssh_keypair
 from terraform_runner import TerraformCancelled, TerraformError
 
 
@@ -44,6 +46,41 @@ def test_state_backend_is_deployment_scoped(tmp_path: Path, provider_id: str, lo
     assert not (runtime / "deployment.tfplan").exists()
     assert not (runtime / "client.privatekey").exists()
     assert not (runtime / "ssh.privatekey").exists()
+
+
+def test_one_generated_ssh_identity_reaches_files_and_terraform_variables(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    orchestrator = make_orchestrator(tmp_path)
+    generated = 0
+    actual_generate = generate_ssh_keypair
+
+    def generate_once() -> tuple[str, str]:
+        nonlocal generated
+        generated += 1
+        return actual_generate()
+
+    monkeypatch.setattr(orchestrator_module, "generate_ssh_keypair", generate_once)
+    result = orchestrator.deploy("aws-lightsail", "us-east-1")
+    record = orchestrator.deployments.get(str(result["deployment_id"]))
+    runtime = Path(record.runtime_directory)
+    variables = json.loads((runtime / "deployment.auto.tfvars.json").read_text(encoding="utf-8"))
+    public_text = (runtime / "ssh.publickey").read_text(encoding="ascii").strip()
+    assert generated == 1
+    assert variables["ssh_public_key"] == public_text
+    assert verify_ssh_keypair(runtime / "ssh.privatekey", runtime / "ssh.publickey") == ssh_public_key_fingerprint(
+        variables["ssh_public_key"]
+    )
+    aws_configuration = (runtime / "terraform-work" / "vpn-aws-lightsail" / "main.tf").read_text(encoding="utf-8")
+    assert "public_key = var.ssh_public_key" in aws_configuration
+
+
+def test_registry_record_cannot_select_another_deployments_runtime(tmp_path: Path) -> None:
+    orchestrator = make_orchestrator(tmp_path)
+    first = add_record(orchestrator, "aws-lightsail", "first")
+    second = add_record(orchestrator, "aws-lightsail", "second")
+    first.runtime_directory = second.runtime_directory
+    first.state_path = second.state_path
+    with pytest.raises(TerraformError, match="runtime identity differs"):
+        orchestrator._assert_record_paths(first)
 
 
 @pytest.mark.parametrize("phase", ["init", "validate", "plan"])
