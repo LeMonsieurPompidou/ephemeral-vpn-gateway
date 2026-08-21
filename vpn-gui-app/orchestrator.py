@@ -1082,11 +1082,17 @@ class Orchestrator:
         return self.deployments.get(deployment_id).to_dict()
 
     def get_client_config(self, deployment_id: str) -> str:
+        return self.client_config_path(deployment_id).read_text(encoding="utf-8")
+
+    def client_config_path(self, deployment_id: str) -> Path:
         record = self.deployments.get(deployment_id)
+        self._assert_record_paths(record)
         path = Path(record.runtime_directory) / "client.conf"
-        if record.state != DeploymentState.READY and not path.exists():
+        if record.state != DeploymentState.READY and not path.is_file():
             raise RuntimeError("Client configuration is not ready")
-        return path.read_text(encoding="utf-8")
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError("Runtime client configuration is missing or unsafe")
+        return path
 
     def get_logs(self, deployment_id: str) -> list[str]:
         record = self.deployments.get(deployment_id)

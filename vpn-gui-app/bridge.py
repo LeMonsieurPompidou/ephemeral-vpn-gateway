@@ -6,11 +6,39 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from config_export import (
+    ConfigExportError,
+    copy_config_bytes,
+    normalize_export_destination,
+    proposed_export_path,
+    resolve_desktop_directory,
+)
 from file_lock import FileLock
 from models import DeploymentOptions, DeploymentState
 from orchestrator import Orchestrator
+
+SaveDialog = Callable[[Path, str], Path | None]
+
+
+def native_save_dialog(directory: Path, filename: str) -> Path | None:
+    try:
+        import webview
+
+        window = webview.windows[0]
+        selection = window.create_file_dialog(
+            webview.FileDialog.SAVE,
+            directory=str(directory),
+            save_filename=filename,
+            file_types=("WireGuard configuration (*.conf)",),
+        )
+    except (AttributeError, ImportError, IndexError, RuntimeError) as exc:
+        raise ConfigExportError("Native Save As dialog is unavailable") from exc
+    if not selection:
+        return None
+    selected = selection if isinstance(selection, str) else selection[0]
+    return Path(selected)
 
 
 def default_runtime_root() -> Path:
@@ -32,6 +60,7 @@ class BridgeService:
         *,
         start_expiration_monitor: bool = True,
         acquire_app_lock: bool = True,
+        save_dialog: SaveDialog = native_save_dialog,
     ) -> None:
         resolved_runtime = (runtime_root or default_runtime_root()).resolve()
         self._app_lock: FileLock | None = None
@@ -44,6 +73,7 @@ class BridgeService:
         self._operation_results: dict[str, dict[str, object]] = {}
         self._logs: dict[str, list[str]] = {}
         self._lock = threading.RLock()
+        self._save_dialog = save_dialog
         self.orchestrator.on_log = self._capture_log
         self.orchestrator.reconcile_interrupted()
         self._expiration_thread: threading.Thread | None = None
@@ -182,12 +212,27 @@ class BridgeService:
         with self._lock:
             return self._logs.get(deployment_id, [])[-250:]
 
-    def save_client_config(self, deployment_id: str, destination: str) -> dict[str, str]:
-        destination_path = Path(destination).expanduser().resolve()
-        content = self.get_client_config(deployment_id)
-        from security import write_secret
+    def get_client_config_export(self, deployment_id: str) -> dict[str, str]:
+        record = self.orchestrator.deployments.get(deployment_id)
+        self.orchestrator.client_config_path(deployment_id)
+        desktop = resolve_desktop_directory()
+        proposed = proposed_export_path(desktop, record.location_id, record.id)
+        return {
+            "status": "ready",
+            "deployment_id": record.id,
+            "directory": str(desktop),
+            "filename": proposed.name,
+            "path": str(proposed),
+        }
 
-        write_secret(destination_path, content)
+    def save_client_config(self, deployment_id: str) -> dict[str, str]:
+        proposal = self.get_client_config_export(deployment_id)
+        source = self.orchestrator.client_config_path(deployment_id)
+        selected = self._save_dialog(Path(proposal["directory"]), proposal["filename"])
+        if selected is None:
+            return {"status": "cancelled", "path": proposal["path"]}
+        destination_path = normalize_export_destination(selected)
+        copy_config_bytes(source, destination_path)
         return {"status": "success", "path": str(destination_path)}
 
     def _capture_log(self, deployment_id: str, line: str) -> None:

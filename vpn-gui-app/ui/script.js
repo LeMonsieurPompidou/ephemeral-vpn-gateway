@@ -2,7 +2,7 @@ const STATES = ['validating_credentials','initializing','planning','provisioning
 const $ = (id) => document.getElementById(id);
 let providers = [], locations = [], legacyStates = [], deploymentId = null, operationId = null;
 let activeDeploymentId = null, currentRecord = null, selectedRecoveryId = null, startedAt = null, timer = null;
-let syncInFlight = false, uiBusy = false;
+let syncInFlight = false, uiBusy = false, configExportProposal = null;
 const api = () => window.pywebview?.api;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -26,7 +26,7 @@ function setState(record, expectedId=deploymentId){
 }
 function resetDeploymentState(){
   deploymentId=null; activeDeploymentId=null; currentRecord=null; selectedRecoveryId=null;
-  $('logs').textContent=''; $('qr-row').classList.add('hidden');
+  $('logs').textContent=''; $('qr-row').classList.add('hidden'); resetConfigExport();
   $('status-text').textContent='Idle'; $('status-dot').className='status-indicator idle';
   $('ip-address').textContent='—'; $('copy-ip').disabled=true; $('expires').textContent='—';
   $('destroy').disabled=true; $('remove-local').disabled=true; renderSteps('idle');
@@ -74,8 +74,31 @@ async function refreshLogs(targetId=deploymentId){
   if(!RecoveryState.canRenderLogs(targetId,deploymentId,activeDeploymentId))return;
   $('logs').textContent=lines.join('\n'); $('logs').scrollTop=$('logs').scrollHeight;
 }
-async function showConfig(config){ const node=$('qrcode'); $('qr-row').classList.remove('hidden'); node.replaceChildren(); if(window.QRCode){new QRCode(node,{text:config,width:152,height:152,correctLevel:QRCode.CorrectLevel.M});}else{node.textContent='QR library unavailable. Save the configuration instead.';} }
-async function destroy(){ if(!deploymentId||!confirm('Destroy this deployment and remove sensitive local recovery artifacts?'))return; setBusy(true); try{const result=await api().destroy(deploymentId,false); if(result.status!=='success')throw new Error(result.message); setState(await api().get_status(deploymentId)); $('qr-row').classList.add('hidden');}catch(e){alert(e.message);} finally{setBusy(false); await loadRecovery();} }
+function resetConfigExport(){configExportProposal=null;$('config-save-path').textContent='Preparing Desktop location…';$('config-save-status').textContent='';$('save-config').disabled=true;}
+async function loadConfigExport(targetId=deploymentId){
+  resetConfigExport(); if(!targetId)return;
+  const proposal=await api().get_client_config_export(targetId);
+  if(targetId!==deploymentId||proposal.deployment_id!==targetId)return;
+  configExportProposal=proposal;$('config-save-path').textContent=proposal.path;$('save-config').disabled=false;
+}
+async function showConfig(config,targetId=deploymentId){
+  const node=$('qrcode'); $('qr-row').classList.remove('hidden'); node.replaceChildren();
+  if(window.QRCode){new QRCode(node,{text:config,width:152,height:152,correctLevel:QRCode.CorrectLevel.M});}else{node.textContent='QR library unavailable. Save the configuration instead.';}
+  try{await loadConfigExport(targetId);}catch{$('config-save-path').textContent='Desktop save location unavailable';$('save-config').disabled=true;}
+}
+async function saveConfig(){
+  const targetId=deploymentId;if(!targetId||!configExportProposal||configExportProposal.deployment_id!==targetId)return;
+  $('save-config').disabled=true;$('config-save-status').textContent='';
+  try{
+    const result=await api().save_client_config(targetId);
+    if(targetId!==deploymentId)return;
+    if(result.status==='cancelled'){$('config-save-status').textContent='Save cancelled.';return;}
+    if(result.status!=='success')throw new Error(result.message||'Configuration could not be saved.');
+    $('config-save-path').textContent=result.path;$('config-save-status').textContent=`Configuration saved: ${result.path}`;
+  }catch(e){if(targetId===deploymentId){$('config-save-status').textContent='Configuration was not saved.';alert(e.message);}}
+  finally{if(targetId===deploymentId)$('save-config').disabled=false;}
+}
+async function destroy(){ if(!deploymentId||!confirm('Destroy this deployment and remove sensitive local recovery artifacts?'))return; setBusy(true); try{const result=await api().destroy(deploymentId,false); if(result.status!=='success')throw new Error(result.message); setState(await api().get_status(deploymentId)); $('qr-row').classList.add('hidden');resetConfigExport();}catch(e){alert(e.message);} finally{setBusy(false); await loadRecovery();} }
 async function removeLocal(){
   if(!deploymentId||selectedRecoveryId!==deploymentId)return;
   try{await api().get_status(deploymentId);}catch{resetDeploymentState();await loadRecovery();return;}
@@ -88,6 +111,7 @@ async function selectRecovery(item){
     const fresh=await api().get_status(item.id);
     if(!fresh||fresh.id!==item.id)throw new Error('Recovery deployment no longer exists.');
     selectedRecoveryId=item.id; deploymentId=item.id; currentRecord=null; setState(fresh,item.id); await refreshLogs(item.id);
+    if(fresh.state==='ready')await showConfig(await api().get_client_config(item.id),item.id);else{$('qr-row').classList.add('hidden');resetConfigExport();}
   }catch{resetDeploymentState();await loadRecovery();}
 }
 async function loadRecovery(){
@@ -142,5 +166,5 @@ async function validateCredentials(){const result=await api().validate_credentia
 async function initialize(){ if(!api()){setTimeout(initialize,100);return;} providers=await api().list_providers(); $('provider').replaceChildren(); providers.forEach((p)=>option($('provider'),p.id,p.display_name)); refreshLocations(); renderSteps('idle'); await loadLegacyStates(); await loadRecovery(); setInterval(()=>{if(!document.hidden)reconcileCurrentDeployment().catch(()=>{});},1000); setInterval(()=>{if(!document.hidden)loadRecovery().catch(()=>{});},5000); }
 $('provider').addEventListener('change',()=>{refreshLocations();setBusy(false);}); $('country').addEventListener('change',refreshRegions); $('location').addEventListener('change',refreshBadges); $('traffic-mode').addEventListener('change',()=>{$('allowed-ips').disabled=$('traffic-mode').value!=='custom';if($('traffic-mode').value==='ipv4')$('allowed-ips').value='0.0.0.0/0';});
 $('deploy').addEventListener('click',()=>deploy().catch((e)=>{alert(e.message);setBusy(Boolean(operationId||activeDeploymentId));})); $('validate-credentials').addEventListener('click',()=>validateCredentials().catch((e)=>alert(e.message))); $('destroy').addEventListener('click',destroy); $('remove-local').addEventListener('click',removeLocal); $('cancel').addEventListener('click',async()=>{if(deploymentId)await api().cancel(deploymentId);});
-$('copy-ip').addEventListener('click',()=>navigator.clipboard.writeText($('ip-address').textContent)); $('save-config').addEventListener('click',async()=>{const destination=prompt('Save to an absolute path (for example C:\\Users\\you\\WireGuard\\vpn.conf):');if(destination)await api().save_client_config(deploymentId,destination);});
+$('copy-ip').addEventListener('click',()=>navigator.clipboard.writeText($('ip-address').textContent)); $('save-config').addEventListener('click',()=>saveConfig());
 window.addEventListener('beforeunload',(event)=>{if(currentRecord?.resources_possible&&currentRecord.state!=='destroyed'){event.preventDefault();event.returnValue='Active cloud resources may still exist.';}}); document.addEventListener('DOMContentLoaded',initialize);

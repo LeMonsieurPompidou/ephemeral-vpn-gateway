@@ -81,3 +81,17 @@ def test_cloud_init_progress_label_uses_safe_persisted_backend_fields() -> None:
         "invalid": "Cloud init: startup (0m00s)",
         "other": None,
     }
+
+
+def test_client_configuration_ui_shows_backend_desktop_path_and_preserves_qr() -> None:
+    index = (ROOT / "vpn-gui-app" / "ui" / "index.html").read_text(encoding="utf-8")
+    script = (ROOT / "vpn-gui-app" / "ui" / "script.js").read_text(encoding="utf-8")
+    assert "Mobile" in index and 'id="qrcode"' in index
+    assert "Desktop" in index and "Save location" in index
+    assert 'id="config-save-path"' in index
+    assert "get_client_config_export(targetId)" in script
+    assert "proposal.path" in script
+    assert "save_client_config(targetId)" in script
+    assert "Configuration saved: ${result.path}" in script
+    assert "Save to an absolute path" not in script
+    assert "new QRCode" in script

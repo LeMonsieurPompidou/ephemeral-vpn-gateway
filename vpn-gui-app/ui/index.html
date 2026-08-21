@@ -36,7 +36,23 @@
     <ol id="steps" class="steps"></ol>
     <div class="status-row"><span>Public IP</span><span><code id="ip-address">—</code> <button id="copy-ip" class="link-btn" disabled>Copy</button></span></div>
     <div class="status-row"><span>Expires</span><span id="expires">—</span></div>
-    <div id="qr-row" class="status-row hidden"><span>Client configuration</span><div><div id="qrcode" class="qrcode"></div><button id="save-config" class="link-btn">Save configuration</button></div></div>
+    <div id="qr-row" class="status-row config-row hidden">
+      <span class="status-row-label">Client configuration</span>
+      <div class="config-options">
+        <div class="config-option">
+          <strong>Mobile</strong>
+          <div id="qrcode" class="qrcode"></div>
+          <span class="muted-text">Scan with the WireGuard mobile app</span>
+        </div>
+        <div class="config-option config-export">
+          <strong>Desktop</strong>
+          <span class="muted-text">Save location</span>
+          <code id="config-save-path" class="config-save-path">Preparing Desktop location…</code>
+          <button id="save-config" class="btn" disabled>Save configuration</button>
+          <span id="config-save-status" class="muted-text" role="status"></span>
+        </div>
+      </div>
+    </div>
     <details><summary>Live non-sensitive logs</summary><pre id="logs" class="logs"></pre></details>
   </section>
 </main>

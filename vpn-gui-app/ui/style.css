@@ -372,6 +372,39 @@ body::before {
     height: 100% !important;
 }
 
+.config-row {
+    align-items: stretch;
+}
+
+.config-options {
+    display: grid;
+    grid-template-columns: minmax(200px, auto) minmax(280px, 1fr);
+    gap: 24px;
+    width: min(100%, 660px);
+}
+
+.config-option {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+}
+
+.config-export {
+    min-width: 0;
+}
+
+.config-save-path {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #f8fafc;
+    color: var(--text);
+    overflow-wrap: anywhere;
+    user-select: text;
+}
+
 .qr-caption {
     max-width: 200px;
     font-size: 11px;
@@ -407,6 +440,10 @@ select, input { width: 100%; padding: 11px 12px; border: 1px solid var(--border)
 @media (max-width: 640px) {
     .app-container {
         padding: 24px 16px 40px;
+    }
+
+    .config-options {
+        grid-template-columns: 1fr;
     }
 
     .header {
