@@ -28,7 +28,8 @@ from client_peers import (
 from cloud_init import FAILURE_MARKER, READINESS_MARKER, bootstrap_source_sha256, render_user_data
 from config_export import ConfigExportError, regular_file_sha256, remove_tracked_config
 from file_lock import FileLock
-from legacy_reconciliation import LegacyReconciliationStore
+from legacy_cloud_verification import LegacyCloudVerifier
+from legacy_reconciliation import LegacyReconciliationStore, LegacySourceStore
 from models import (
     ClientExportMetadata,
     ClientMetadata,
@@ -83,6 +84,7 @@ SSH_SERVER_ALIVE_INTERVAL_SECONDS = 5
 SSH_SERVER_ALIVE_COUNT_MAX = 2
 SSH_PROCESS_TIMEOUT_SECONDS = 25.0
 SSH_PROBE_OUTAGE_ALLOWANCE_SECONDS = 90.0
+LEGACY_VERIFICATION_MAX_AGE_SECONDS = 15 * 60
 CLOUD_INIT_PROGRESS_COMMAND = (
     "status=/var/lib/ephemeral-vpn/bootstrap-status; "
     "output=/var/log/cloud-init-output.log; "
@@ -141,6 +143,9 @@ class Orchestrator:
         self.providers = ProviderRegistry(self.catalog)
         self.deployments = DeploymentRegistry(self.runtime_root / "deployments.json")
         self.legacy_reconciliations = LegacyReconciliationStore(self.runtime_root / "legacy-reconciliations")
+        self.legacy_verifications = LegacyReconciliationStore(self.runtime_root / "legacy-verifications")
+        self.legacy_sources = LegacySourceStore(self.runtime_root / "legacy-source-roots.json")
+        self.legacy_cloud_verifier = LegacyCloudVerifier()
         self.runner = runner or TerraformRunner()
         self.ip_detector = ip_detector
         if readiness_timeout is not None:
@@ -1263,10 +1268,12 @@ class Orchestrator:
         for report in reports:
             if report["stale_reconciliation_available"]:
                 snapshots[str(report["provider_id"])] = {
-                    "primary_path": report["primary_path"],
+                    "source_kind": report["source_kind"],
+                    "source_path": report["source_path"],
+                    "source_sha256": report["source_sha256"],
+                    "source_lineage": report["source_lineage"],
+                    "source_serial": report["source_serial"],
                     "primary_sha256": report["primary_sha256"],
-                    "primary_lineage": report["primary_lineage"],
-                    "primary_serial": report["primary_serial"],
                     "backup_sha256": report["backup_sha256"],
                 }
         with self._legacy_snapshot_lock:
@@ -1303,10 +1310,47 @@ class Orchestrator:
         self.deployments.save(record)
         return {"status": "success", "deployment_id": record.id, "source_preserved": True}
 
+    def verify_legacy_cloud_state(self, provider_id: str) -> dict[str, object]:
+        directory = self._legacy_provider_directory(provider_id)
+        with self._provider_operation_lock(provider_id, directory):
+            report = self._inspect_legacy_provider(provider_id)
+            if not report["cloud_verification_available"]:
+                raise TerraformError("Legacy state is not eligible for read-only cloud verification")
+            source = Path(str(report["source_path"]))
+            before = self._legacy_state_fingerprints(report)
+            result = self.legacy_cloud_verifier.verify(provider_id, source, directory)
+            refreshed = self._inspect_legacy_provider(provider_id)
+            if self._legacy_state_fingerprints(refreshed) != before:
+                raise TerraformError("Legacy state changed during cloud verification; verify it again")
+            receipt = {
+                "version": 1,
+                "provider_id": provider_id,
+                "status": result.get("status"),
+                "message": result.get("message"),
+                "verified_at": now_iso(),
+                "source_kind": report["source_kind"],
+                "source_path": report["source_path"],
+                "source_sha256": report["source_sha256"],
+                "terraform_lineage": report["source_lineage"],
+                "terraform_serial": report["source_serial"],
+                "primary_sha256": report["primary_sha256"],
+                "backup_sha256": report["backup_sha256"],
+                "resources": result.get("resources", []),
+            }
+            self.legacy_verifications.write(provider_id, receipt)
+            verified = self._inspect_legacy_provider(provider_id)
+            return {
+                "status": str(result.get("status")),
+                "provider_id": provider_id,
+                "message": str(result.get("message")),
+                "resources": result.get("resources", []),
+                "legacy_state": verified,
+            }
+
     def reconcile_stale_legacy_state(self, provider_id: str, confirmed: bool) -> dict[str, object]:
         if confirmed is not True:
             raise TerraformError("Explicit confirmation of independently verified cloud absence is required")
-        directory = self._provider_directory(provider_id)
+        directory = self._legacy_provider_directory(provider_id)
         with self._legacy_snapshot_lock:
             displayed = self._legacy_confirmation_snapshots.pop(provider_id, None)
         if displayed is None:
@@ -1317,23 +1361,29 @@ class Orchestrator:
             if not report["stale_reconciliation_available"]:
                 raise TerraformError("Legacy state is not eligible for stale-state reconciliation")
             current = {
-                "primary_path": report["primary_path"],
+                "source_kind": report["source_kind"],
+                "source_path": report["source_path"],
+                "source_sha256": report["source_sha256"],
+                "source_lineage": report["source_lineage"],
+                "source_serial": report["source_serial"],
                 "primary_sha256": report["primary_sha256"],
-                "primary_lineage": report["primary_lineage"],
-                "primary_serial": report["primary_serial"],
                 "backup_sha256": report["backup_sha256"],
             }
             if current != displayed:
                 raise TerraformError("Legacy state changed after it was displayed; refresh and review it again")
 
-            source = Path(str(report["primary_path"]))
+            cloud_verification: dict[str, Any] | None = None
+            if report["classification"] == "ambiguous":
+                cloud_verification, verification_reason = self._verified_cloud_absence(report)
+                if cloud_verification is None:
+                    raise TerraformError(f"Cloud-absence verification is invalid: {verification_reason}")
+
+            source = Path(str(report["source_path"]))
+            primary = Path(str(report["primary_path"]))
             backup = Path(str(report["backup_path"]))
             source_snapshot = self._source_state_snapshot(directory)
-            fingerprint = str(report["primary_sha256"])
-            if (
-                source_snapshot.get(source.name) != fingerprint
-                or source_snapshot.get(backup.name) != report["backup_sha256"]
-            ):
+            fingerprint = str(report["source_sha256"])
+            if source_snapshot.get(source.name) != fingerprint:
                 raise TerraformError("Legacy state changed before quarantine creation; refresh and review it again")
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             quarantine_root = (self.runtime_root / "legacy-quarantine" / provider_id).resolve()
@@ -1346,7 +1396,7 @@ class Orchestrator:
             quarantine.mkdir(parents=True, exist_ok=False)
             quarantine_files: list[dict[str, object]] = []
             try:
-                for original in (source, backup):
+                for original in (primary, backup):
                     expected_sha = source_snapshot.get(original.name)
                     if expected_sha is None:
                         continue
@@ -1370,14 +1420,16 @@ class Orchestrator:
                 raise
 
             receipt: dict[str, Any] = {
-                "version": 1,
+                "version": 2,
                 "provider_id": provider_id,
+                "source_kind": report["source_kind"],
                 "source_path": str(source.resolve()),
                 "source_sha256": fingerprint,
-                "source_backup_sha256": report["backup_sha256"],
-                "terraform_lineage": report["primary_lineage"],
-                "terraform_serial": report["primary_serial"],
-                "resource_count": report["primary_resources"],
+                "primary_sha256": report["primary_sha256"],
+                "backup_sha256": report["backup_sha256"],
+                "terraform_lineage": report["source_lineage"],
+                "terraform_serial": report["source_serial"],
+                "resource_count": report["source_resources"],
                 "resources": report["resource_summary"],
                 "outputs": report["outputs_summary"],
                 "reconciled_at": now_iso(),
@@ -1386,6 +1438,12 @@ class Orchestrator:
                 "quarantine_files": quarantine_files,
                 "status": "reconciled-stale",
             }
+            if cloud_verification is not None:
+                receipt["cloud_verification"] = {
+                    "verified_at": cloud_verification["verified_at"],
+                    "source_sha256": cloud_verification["source_sha256"],
+                    "status": "all_absent",
+                }
             receipt_path = self.legacy_reconciliations.write(provider_id, receipt)
             verified = self._inspect_legacy_provider(provider_id)
             if verified["classification"] != "reconciled-stale" or verified["blocking"]:
@@ -1400,7 +1458,7 @@ class Orchestrator:
             }
 
     def _inspect_legacy_provider(self, provider_id: str) -> dict[str, object]:
-        directory = self._provider_directory(provider_id)
+        directory = self._legacy_provider_directory(provider_id)
         primary = directory / "terraform.tfstate"
         backup = directory / "terraform.tfstate.backup"
         primary_info = self._inspect_state_file(primary)
@@ -1410,6 +1468,8 @@ class Orchestrator:
         reason = "No provider-root state files detected"
         migration_available = False
         stale_reconciliation_available = False
+        cloud_verification_available = False
+        cloud_verification: dict[str, object] | None = None
         blocking = False
         if primary_info["exists"] and not primary_info["parseable"]:
             classification, reason, blocking = "malformed", "Primary provider-root state is malformed", True
@@ -1425,7 +1485,10 @@ class Orchestrator:
             blocking = True
         elif primary_info["exists"] or backup_info["exists"]:
             classification, reason = "empty", "Provider-root state files contain no managed resources"
-        fingerprint = primary_info.get("sha256")
+        source_kind = "backup" if classification == "ambiguous" else "primary"
+        source = backup if source_kind == "backup" else primary
+        source_info = backup_info if source_kind == "backup" else primary_info
+        fingerprint = source_info.get("sha256")
         receipt_details: dict[str, object] | None = None
         if classification == "active" and isinstance(fingerprint, str):
             migrated_records = [
@@ -1447,30 +1510,61 @@ class Orchestrator:
                 else:
                     reason = f"Recorded legacy migration is invalid: {migration_reason}"
 
-            if classification == "active":
-                if receipt_error:
-                    reason = f"Stale-state reconciliation is invalid: {receipt_error}"
-                elif receipt is not None:
-                    valid, receipt_reason, receipt_details = self._verify_stale_receipt(
-                        provider_id, primary, backup, primary_info, backup_info, receipt
-                    )
-                    if valid:
-                        classification, reason, blocking = (
-                            "reconciled-stale",
-                            "Historical state preserved; cloud absence was explicitly confirmed",
-                            False,
-                        )
-                        migration_available = False
-                    else:
-                        reason = f"Stale-state reconciliation is invalid: {receipt_reason}"
-                stale_reconciliation_available = (
-                    classification == "active"
-                    and not migration_available
-                    and isinstance(primary_info.get("lineage"), str)
-                    and bool(primary_info.get("lineage"))
-                    and isinstance(primary_info.get("serial"), int)
-                    and not isinstance(primary_info.get("serial"), bool)
+        if classification in {"active", "ambiguous"} and isinstance(fingerprint, str):
+            if receipt_error:
+                reason = f"Stale-state reconciliation is invalid: {receipt_error}"
+            elif receipt is not None:
+                valid, receipt_reason, receipt_details = self._verify_stale_receipt(
+                    provider_id,
+                    source_kind,
+                    source,
+                    primary,
+                    backup,
+                    source_info,
+                    primary_info,
+                    backup_info,
+                    receipt,
                 )
+                if valid:
+                    classification, reason, blocking = (
+                        "reconciled-stale",
+                        "Historical state preserved; cloud absence was explicitly confirmed",
+                        False,
+                    )
+                    migration_available = False
+                else:
+                    reason = f"Stale-state reconciliation is invalid: {receipt_reason}"
+            identity_complete = (
+                isinstance(source_info.get("lineage"), str)
+                and bool(source_info.get("lineage"))
+                and isinstance(source_info.get("serial"), int)
+                and not isinstance(source_info.get("serial"), bool)
+            )
+            if classification == "active":
+                stale_reconciliation_available = bool(not migration_available and identity_complete)
+            elif classification == "ambiguous":
+                cloud_verification_available = bool(identity_complete)
+                verification_report = {
+                    "provider_id": provider_id,
+                    "source_kind": source_kind,
+                    "source_path": str(source),
+                    "source_sha256": source_info.get("sha256"),
+                    "source_lineage": source_info.get("lineage"),
+                    "source_serial": source_info.get("serial"),
+                    "primary_sha256": primary_info.get("sha256"),
+                    "backup_sha256": backup_info.get("sha256"),
+                }
+                verification, verification_reason = self._cloud_verification(verification_report)
+                if verification is not None:
+                    cloud_verification = {
+                        "status": verification.get("status"),
+                        "message": verification.get("message"),
+                        "verified_at": verification.get("verified_at"),
+                        "resources": verification.get("resources", []),
+                    }
+                    stale_reconciliation_available = verification.get("status") == "all_absent"
+                elif verification_reason:
+                    cloud_verification = {"status": "invalid", "message": verification_reason}
         if classification not in {"active", "migrated", "reconciled-stale"} and (
             receipt is not None or receipt_error is not None
         ):
@@ -1485,16 +1579,30 @@ class Orchestrator:
             "blocking": blocking,
             "migration_available": migration_available,
             "stale_reconciliation_available": stale_reconciliation_available,
+            "cloud_verification_available": cloud_verification_available,
+            "cloud_verification": cloud_verification,
+            "source_kind": source_kind,
+            "source_path": str(source),
+            "source_sha256": source_info.get("sha256"),
+            "source_resources": source_info.get("resources", 0),
+            "source_lineage": source_info.get("lineage"),
+            "source_serial": source_info.get("serial"),
             "primary_path": str(primary),
+            "primary_exists": primary_info["exists"],
+            "primary_parseable": primary_info["parseable"],
             "primary_sha256": primary_info.get("sha256"),
             "primary_resources": primary_info["resources"],
             "primary_lineage": primary_info.get("lineage"),
             "primary_serial": primary_info.get("serial"),
-            "resource_summary": primary_info.get("resource_summary", []),
-            "outputs_summary": primary_info.get("outputs_summary", []),
+            "resource_summary": source_info.get("resource_summary", []),
+            "outputs_summary": source_info.get("outputs_summary", []),
             "backup_path": str(backup),
+            "backup_exists": backup_info["exists"],
+            "backup_parseable": backup_info["parseable"],
             "backup_sha256": backup_info.get("sha256"),
             "backup_resources": backup_info["resources"],
+            "backup_lineage": backup_info.get("lineage"),
+            "backup_serial": backup_info.get("serial"),
             "reconciliation": receipt_details,
         }
 
@@ -1646,16 +1754,81 @@ class Orchestrator:
             return False, "matching runtime state provider identity differs"
         return True, "verified"
 
+    def _cloud_verification(self, report: dict[str, object]) -> tuple[dict[str, Any] | None, str | None]:
+        provider_id = str(report.get("provider_id", ""))
+        receipt, error = self.legacy_verifications.read(provider_id)
+        if error:
+            return None, error
+        if receipt is None:
+            return None, None
+        expected = {
+            "provider_id": provider_id,
+            "source_kind": report.get("source_kind"),
+            "source_path": report.get("source_path"),
+            "source_sha256": report.get("source_sha256"),
+            "terraform_lineage": report.get("source_lineage"),
+            "terraform_serial": report.get("source_serial"),
+            "primary_sha256": report.get("primary_sha256"),
+            "backup_sha256": report.get("backup_sha256"),
+        }
+        if receipt.get("version") != 1 or any(receipt.get(key) != value for key, value in expected.items()):
+            return None, "Cloud verification no longer matches the exact legacy state fingerprint."
+        verified_at = receipt.get("verified_at")
+        if not isinstance(verified_at, str):
+            return None, "Cloud verification timestamp is missing."
+        try:
+            timestamp = datetime.fromisoformat(verified_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None, "Cloud verification timestamp is malformed."
+        if timestamp.tzinfo is None:
+            return None, "Cloud verification timestamp has no timezone."
+        age = (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
+        if age < 0 or age > LEGACY_VERIFICATION_MAX_AGE_SECONDS:
+            return None, "Cloud verification expired; run it again before reconciliation."
+        resources = receipt.get("resources")
+        if not isinstance(resources, list):
+            return None, "Cloud verification evidence is malformed."
+        return receipt, None
+
+    def _verified_cloud_absence(self, report: dict[str, object]) -> tuple[dict[str, Any] | None, str | None]:
+        receipt, error = self._cloud_verification(report)
+        if receipt is None:
+            return None, error
+        if receipt.get("status") != "all_absent":
+            return None, "Cloud verification did not confirm that every exact resource is absent."
+        if any(
+            not isinstance(item, dict) or item.get("status") not in {"absent", "local_only"}
+            for item in receipt["resources"]
+        ):
+            return None, "Cloud verification evidence contains an unresolved resource."
+        return receipt, None
+
+    @staticmethod
+    def _legacy_state_fingerprints(report: dict[str, object]) -> dict[str, object]:
+        return {
+            "source_kind": report.get("source_kind"),
+            "source_path": report.get("source_path"),
+            "source_sha256": report.get("source_sha256"),
+            "source_lineage": report.get("source_lineage"),
+            "source_serial": report.get("source_serial"),
+            "primary_sha256": report.get("primary_sha256"),
+            "backup_sha256": report.get("backup_sha256"),
+        }
+
     def _verify_stale_receipt(
         self,
         provider_id: str,
+        source_kind: str,
         source: Path,
+        primary: Path,
         backup: Path,
+        source_info: dict[str, object],
         primary_info: dict[str, object],
         backup_info: dict[str, object],
         receipt: dict[str, Any],
     ) -> tuple[bool, str, dict[str, object] | None]:
-        if receipt.get("version") != 1:
+        version = receipt.get("version")
+        if version not in {1, 2}:
             return False, "unsupported receipt version", None
         if receipt.get("provider_id") != provider_id:
             return False, "receipt belongs to another provider", None
@@ -1665,19 +1838,37 @@ class Orchestrator:
             return False, "receipt reason is invalid", None
         if receipt.get("source_path") != str(source.resolve()):
             return False, "source path differs from the receipt", None
-        if receipt.get("source_sha256") != primary_info.get("sha256"):
+        if receipt.get("source_sha256") != source_info.get("sha256"):
             return False, "source fingerprint differs from the receipt", None
-        if receipt.get("source_backup_sha256") != backup_info.get("sha256"):
-            return False, "provider-root backup fingerprint differs from the receipt", None
-        if receipt.get("terraform_lineage") != primary_info.get("lineage"):
+        if version == 1:
+            if source_kind != "primary":
+                return False, "version 1 receipt cannot reconcile a resource-bearing backup", None
+            if receipt.get("source_backup_sha256") != backup_info.get("sha256"):
+                return False, "provider-root backup fingerprint differs from the receipt", None
+        else:
+            if receipt.get("source_kind") != source_kind:
+                return False, "resource-bearing state location differs from the receipt", None
+            if receipt.get("primary_sha256") != primary_info.get("sha256"):
+                return False, "provider-root primary fingerprint differs from the receipt", None
+            if receipt.get("backup_sha256") != backup_info.get("sha256"):
+                return False, "provider-root backup fingerprint differs from the receipt", None
+            if source_kind == "backup":
+                verification = receipt.get("cloud_verification")
+                if (
+                    not isinstance(verification, dict)
+                    or verification.get("status") != "all_absent"
+                    or verification.get("source_sha256") != source_info.get("sha256")
+                ):
+                    return False, "cloud-absence verification proof is missing or mismatched", None
+        if receipt.get("terraform_lineage") != source_info.get("lineage"):
             return False, "Terraform lineage differs from the receipt", None
-        if receipt.get("terraform_serial") != primary_info.get("serial"):
+        if receipt.get("terraform_serial") != source_info.get("serial"):
             return False, "Terraform serial differs from the receipt", None
-        if receipt.get("resource_count") != primary_info.get("resources"):
+        if receipt.get("resource_count") != source_info.get("resources"):
             return False, "managed resource count differs from the receipt", None
-        if receipt.get("resources") != primary_info.get("resource_summary"):
+        if receipt.get("resources") != source_info.get("resource_summary"):
             return False, "managed resource summary differs from the receipt", None
-        if receipt.get("outputs") != primary_info.get("outputs_summary"):
+        if receipt.get("outputs") != source_info.get("outputs_summary"):
             return False, "output summary differs from the receipt", None
 
         quarantine_root = (self.runtime_root / "legacy-quarantine" / provider_id).resolve()
@@ -1690,9 +1881,11 @@ class Orchestrator:
         files = receipt.get("quarantine_files")
         if not isinstance(files, list):
             return False, "quarantine file manifest is missing", None
-        expected = {"terraform.tfstate": primary_info.get("sha256")}
+        expected: dict[str, object] = {}
+        if primary_info.get("sha256") is not None:
+            expected[primary.name] = primary_info.get("sha256")
         if backup_info.get("sha256") is not None:
-            expected["terraform.tfstate.backup"] = backup_info.get("sha256")
+            expected[backup.name] = backup_info.get("sha256")
         if len(files) != len(expected):
             return False, "quarantine file manifest is incomplete", None
         seen: set[str] = set()
@@ -1721,9 +1914,9 @@ class Orchestrator:
             return False, "reconciliation timestamp is missing", None
         details = {
             "reconciled_at": reconciled_at,
-            "fingerprint": str(primary_info.get("sha256", "")),
+            "fingerprint": str(source_info.get("sha256", "")),
             "quarantine_path": str(quarantine),
-            "resource_count": primary_info.get("resources", 0),
+            "resource_count": source_info.get("resources", 0),
         }
         return True, "verified", details
 
@@ -1775,6 +1968,15 @@ class Orchestrator:
             raise TerraformError(
                 f"New {provider_id} deployment blocked until existing cloud-capable deployment is reconciled"
             )
+
+    def _legacy_provider_directory(self, provider_id: str) -> Path:
+        recorded = self.legacy_sources.get(provider_id)
+        if recorded is not None:
+            return recorded
+        current = self._provider_directory(provider_id)
+        if any((current / name).is_file() for name in LEGACY_STATE_NAMES):
+            self.legacy_sources.remember(provider_id, current)
+        return current
 
     def _provider_directory(self, provider_id: str) -> Path:
         provider = self.providers.get(provider_id)

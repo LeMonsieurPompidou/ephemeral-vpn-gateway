@@ -11,7 +11,7 @@ from models import DeploymentState
 
 
 def deployment_runtime_names(bridge: BridgeService) -> list[str]:
-    infrastructure = {"legacy-reconciliations", "legacy-quarantine", "locks"}
+    infrastructure = {"legacy-reconciliations", "legacy-verifications", "legacy-quarantine", "locks"}
     return sorted(
         path.name
         for path in bridge.orchestrator.runtime_root.iterdir()

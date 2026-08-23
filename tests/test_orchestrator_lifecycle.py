@@ -5,7 +5,7 @@ from pathlib import Path
 
 import orchestrator as orchestrator_module
 import pytest
-from helpers import FakeTerraformRunner, add_record, legacy_state, make_orchestrator
+from helpers import FakeTerraformRunner, add_record, legacy_state, make_orchestrator, make_resource_root
 from models import DeploymentOptions, DeploymentState
 from security import generate_ssh_keypair, ssh_public_key_fingerprint, verify_ssh_keypair
 from terraform_runner import TerraformCancelled, TerraformError
@@ -206,6 +206,53 @@ def test_legacy_empty_malformed_and_ambiguous_states(tmp_path: Path) -> None:
     report = orchestrator._inspect_legacy_provider("aws-lightsail")
     assert report["classification"] == "ambiguous"
     assert report["blocking"]
+
+
+@pytest.mark.parametrize(
+    ("blocking_provider", "healthy_provider"),
+    [
+        ("digitalocean", "aws-lightsail"),
+        ("scaleway", "aws-lightsail"),
+        ("digitalocean", "scaleway"),
+        ("scaleway", "digitalocean"),
+    ],
+)
+def test_legacy_blocking_is_provider_scoped(tmp_path: Path, blocking_provider: str, healthy_provider: str) -> None:
+    orchestrator = make_orchestrator(tmp_path)
+    source = orchestrator._provider_directory(blocking_provider) / "terraform.tfstate"
+    source.write_text(json.dumps(legacy_state(blocking_provider)), encoding="utf-8")
+
+    with pytest.raises(TerraformError, match=f"New {blocking_provider} deployment blocked"):
+        orchestrator._assert_provider_ready_for_new_deployment(blocking_provider)
+    orchestrator._assert_provider_ready_for_new_deployment(healthy_provider)
+
+
+@pytest.mark.parametrize("provider_id", ["digitalocean", "scaleway"])
+def test_same_provider_legacy_blocker_remains_enforced(tmp_path: Path, provider_id: str) -> None:
+    orchestrator = make_orchestrator(tmp_path)
+    directory = orchestrator._provider_directory(provider_id)
+    directory.joinpath("terraform.tfstate").write_text('{"version":4,"resources":[]}', encoding="utf-8")
+    directory.joinpath("terraform.tfstate.backup").write_text(json.dumps(legacy_state(provider_id)), encoding="utf-8")
+    with pytest.raises(TerraformError, match="ambiguous legacy state"):
+        orchestrator._assert_provider_ready_for_new_deployment(provider_id)
+
+
+def test_source_and_packaged_roots_share_persisted_legacy_source_path(tmp_path: Path) -> None:
+    source_root = make_resource_root(tmp_path / "source-run")
+    packaged_root = make_resource_root(tmp_path / "packaged-run")
+    runtime_root = tmp_path / "shared-local-app-data"
+    source_orchestrator = orchestrator_module.Orchestrator(source_root, runtime_root, FakeTerraformRunner())
+    state = source_root / "vpn-digitalocean" / "terraform.tfstate"
+    state.write_text(json.dumps(legacy_state("digitalocean")), encoding="utf-8")
+    original = state.read_bytes()
+    source_report = source_orchestrator._inspect_legacy_provider("digitalocean")
+
+    packaged_orchestrator = orchestrator_module.Orchestrator(packaged_root, runtime_root, FakeTerraformRunner())
+    packaged_report = packaged_orchestrator._inspect_legacy_provider("digitalocean")
+
+    assert packaged_report["source_path"] == source_report["source_path"] == str(state)
+    assert packaged_report["source_sha256"] == source_report["source_sha256"]
+    assert state.read_bytes() == original
 
 
 def test_interrupted_apply_is_reconciled_on_restart(tmp_path: Path) -> None:

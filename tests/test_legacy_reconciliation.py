@@ -44,6 +44,19 @@ def reconcile(orchestrator: Orchestrator) -> dict[str, object]:
     return orchestrator.reconcile_stale_legacy_state("aws-lightsail", True)
 
 
+def ambiguous_legacy(orchestrator: Orchestrator, provider_id: str) -> tuple[Path, Path]:
+    directory = orchestrator._provider_directory(provider_id)
+    primary = directory / "terraform.tfstate"
+    backup = directory / "terraform.tfstate.backup"
+    primary.write_text(json.dumps({"version": 4, "lineage": "same", "serial": 20, "resources": []}), encoding="utf-8")
+    state = legacy_state(provider_id)
+    state["lineage"] = "same"
+    state["serial"] = 10
+    state["resources"][0]["instances"][0]["attributes"] = {"id": "historical-resource"}  # type: ignore[index]
+    backup.write_text(json.dumps(state), encoding="utf-8")
+    return primary, backup
+
+
 def test_stale_reconciliation_creates_verified_receipt_and_quarantine(tmp_path: Path) -> None:
     orchestrator = make_orchestrator(tmp_path)
     source = active_legacy(orchestrator, backup=True)
@@ -86,6 +99,78 @@ def test_stale_reconciliation_creates_verified_receipt_and_quarantine(tmp_path: 
         ip_detector=lambda: "198.51.100.10/32",
     )
     assert restarted._inspect_legacy_provider("aws-lightsail")["classification"] == "reconciled-stale"
+
+
+@pytest.mark.parametrize("provider_id", ["digitalocean", "scaleway"])
+def test_verified_absent_ambiguous_backup_can_be_reconciled(tmp_path: Path, provider_id: str) -> None:
+    orchestrator = make_orchestrator(tmp_path)
+    primary, backup = ambiguous_legacy(orchestrator, provider_id)
+    original = {primary: primary.read_bytes(), backup: backup.read_bytes()}
+    orchestrator.legacy_cloud_verifier.verify = lambda *_args: {  # type: ignore[method-assign]
+        "status": "all_absent",
+        "message": "No legacy cloud resources were found.",
+        "resources": [
+            {
+                "address": f"{provider_id}.vpn",
+                "type": "cloud",
+                "identifier": "historical-resource",
+                "status": "absent",
+            }
+        ],
+    }
+
+    before = report_for(orchestrator, provider_id)
+    assert before["classification"] == "ambiguous"
+    assert before["source_kind"] == "backup"
+    assert before["cloud_verification_available"]
+    assert not before["stale_reconciliation_available"]
+    orchestrator.verify_legacy_cloud_state(provider_id)
+    reviewed = report_for(orchestrator, provider_id)
+    assert reviewed["stale_reconciliation_available"]
+    result = orchestrator.reconcile_stale_legacy_state(provider_id, True)
+
+    assert result["classification"] == "reconciled-stale"
+    assert not report_for(orchestrator, provider_id)["blocking"]
+    assert all(path.read_bytes() == content for path, content in original.items())
+    receipt = json.loads(
+        (orchestrator.runtime_root / "legacy-reconciliations" / f"{provider_id}.json").read_text(encoding="utf-8")
+    )
+    assert receipt["version"] == 2 and receipt["source_kind"] == "backup"
+    assert receipt["source_sha256"] == orchestrator._sha256(backup)
+    assert receipt["cloud_verification"]["status"] == "all_absent"
+
+
+@pytest.mark.parametrize(
+    "status", ["resources_exist", "api_unavailable", "credentials_unavailable", "identity_mismatch"]
+)
+def test_ambiguous_reconciliation_forbidden_without_verified_absence(tmp_path: Path, status: str) -> None:
+    orchestrator = make_orchestrator(tmp_path)
+    ambiguous_legacy(orchestrator, "digitalocean")
+    orchestrator.legacy_cloud_verifier.verify = lambda *_args: {  # type: ignore[method-assign]
+        "status": status,
+        "message": "inconclusive",
+        "resources": [{"status": "exists" if status == "resources_exist" else status}],
+    }
+    orchestrator.verify_legacy_cloud_state("digitalocean")
+    report = report_for(orchestrator, "digitalocean")
+    assert report["blocking"] and not report["stale_reconciliation_available"]
+    with pytest.raises(TerraformError, match="must be refreshed|not eligible"):
+        orchestrator.reconcile_stale_legacy_state("digitalocean", True)
+
+
+def test_state_fingerprint_change_invalidates_cloud_verification(tmp_path: Path) -> None:
+    orchestrator = make_orchestrator(tmp_path)
+    _, backup = ambiguous_legacy(orchestrator, "digitalocean")
+    orchestrator.legacy_cloud_verifier.verify = lambda *_args: {  # type: ignore[method-assign]
+        "status": "all_absent",
+        "message": "absent",
+        "resources": [{"status": "absent"}],
+    }
+    orchestrator.verify_legacy_cloud_state("digitalocean")
+    backup.write_bytes(backup.read_bytes() + b"\n")
+    report = report_for(orchestrator, "digitalocean")
+    assert report["blocking"] and not report["stale_reconciliation_available"]
+    assert report["cloud_verification"]["status"] == "invalid"  # type: ignore[index]
 
 
 def test_stale_reconciliation_requires_explicit_confirmation(tmp_path: Path) -> None:

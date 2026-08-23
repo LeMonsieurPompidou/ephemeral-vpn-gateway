@@ -63,9 +63,10 @@ The Gateway form never shows the large technical legacy-state card. Empty, valid
 - Automatic migration is offered only when the primary state's provider resources and server public key match exactly one existing deployment registry record.
 - Migration creates a timestamped runtime backup, copies the state into that matched deployment's runtime, verifies hashes, and records the source and backup in registry metadata.
 - If no runtime deployment matches, **Mark stale — cloud absence confirmed** is available for a parseable active state. It requires the operator to type an explicit confirmation after independently verifying that every summarized cloud resource is absent. The action does not contact the provider or run Terraform.
+- An empty primary with a resource-bearing backup remains ambiguous. For DigitalOcean and Scaleway, **Verify cloud state** performs only exact, read-only provider GET requests for the resource identities in that backup. A short-lived verification receipt is bound to both state-file fingerprints. **Mark stale and reconcile** appears only when every supported cloud object is confirmed absent; any existing object, unavailable credential/API, unsupported identity, changed state byte, or expired verification keeps that provider blocked.
 - Stale reconciliation copies the primary state and any backup to `%LOCALAPPDATA%\EphemeralVpnGateway\legacy-quarantine\<provider>\<timestamp>-<short-sha>\`, verifies the copies, and atomically stores a receipt under `legacy-reconciliations`. The provider is unblocked only while the source path, SHA-256, lineage, serial, resource/output summaries, and quarantine copies still match that receipt.
 - A migrated classification is valid only while the recorded deployment runtime still contains a parseable, provider-matching state with the same SHA-256 as the legacy source.
-- Empty or ambiguous backups require explicit operator reconciliation; the application does not guess which snapshot represents cloud reality.
+- Blocking is provider-scoped: an unresolved DigitalOcean state cannot unblock DigitalOcean, but it does not prevent a new AWS or Scaleway deployment. Source runs and packaged runs share the canonical legacy source mapping, verification receipts, reconciliation receipts, and quarantine roots under the same LocalAppData application root.
 
 ## Credentials
 

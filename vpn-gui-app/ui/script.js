@@ -14,7 +14,8 @@ function updateActionButtons(){const state=currentRecord?.state||'idle';const cl
 function setBusy(busy){ uiBusy=busy; $('deploy').disabled=busy || providerBlocked(); $('validate-credentials').disabled=busy; $('cancel').disabled=!busy || !deploymentId; $('provider').disabled=busy; $('country').disabled=busy; $('location').disabled=busy; $('expiration').disabled=busy; $('client-count').disabled=busy; updateActionButtons(); }
 function stateLabel(value){ return String(value).replaceAll('_',' ').replace(/^./,(c)=>c.toUpperCase()); }
 function renderSteps(state){ $('steps').replaceChildren(...STATES.map((value)=>{ const li=document.createElement('li'); li.textContent=stateLabel(value); const index=STATES.indexOf(state); li.className=STATES.indexOf(value)<index?'done':value===state?'active':''; return li; })); }
-function providerBlocked(){ return legacyStates.some((item)=>item.provider_id===$('provider').value && item.blocking); }
+function selectedLegacyBlockers(){return RecoveryState.blockingLegacyStatesForProvider(legacyStates,$('provider').value);}
+function providerBlocked(){ return selectedLegacyBlockers().length>0; }
 function setState(record, expectedId=deploymentId){
   if(!RecoveryState.acceptsBackendRecord(currentRecord,record,expectedId))return false;
   currentRecord=currentRecord?.id===record.id?{...currentRecord,...record}:{...record}; deploymentId=expectedId;
@@ -159,35 +160,52 @@ async function reconcileCurrentDeployment(){
     if(!activeDeploymentId&&selectedRecoveryId===targetId)resetDeploymentState();
   }finally{syncInFlight=false;}
 }
-function staleConfirmationText(item){
+  function staleConfirmationText(item){
   const resources=(item.resource_summary||[]).map((resource)=>{const ids=(resource.identifiers||[]).join(', ')||'no safe identifier recorded';return `- ${resource.address} [${ids}]`;});
   const phrase='I have independently verified that all listed cloud resources are absent.';
   return {phrase,message:[
     'This action does not contact the cloud provider.',
     'You must independently verify that every listed resource no longer exists.',
-    '',`Provider: ${item.provider_id}`,`Managed resources: ${item.primary_resources}`,`Terraform lineage: ${item.primary_lineage}`,`Terraform serial: ${item.primary_serial}`,`SHA-256: ${String(item.primary_sha256).slice(0,12)}`,'Resources:',...resources,'','Type this exact sentence to continue:',phrase
-  ].join('\n')};
-}
-async function reconcileStale(item){
+      '',`Provider: ${item.provider_id}`,`Managed resources: ${item.source_resources}`,`Terraform lineage: ${item.source_lineage}`,`Terraform serial: ${item.source_serial}`,`SHA-256: ${String(item.source_sha256).slice(0,12)}`,'Resources:',...resources,'','Type this exact sentence to continue:',phrase
+    ].join('\n')};
+  }
+  async function reconcileStale(item){
   const confirmation=staleConfirmationText(item);
   if(prompt(confirmation.message,'')!==confirmation.phrase)return;
   try{await api().reconcile_stale_legacy_state(item.provider_id,true);await loadLegacyStates();await loadRecovery();}catch(e){alert(e.message);await loadLegacyStates();}
-}
-async function loadLegacyStates(){
-  legacyStates=await api().list_legacy_states(); const visible=legacyStates.filter((item)=>item.blocking);
-  $('legacy-warning').classList.toggle('hidden',!visible.length);
-  $('legacy-tools').classList.toggle('hidden',!visible.length);
-  $('legacy-list').replaceChildren(...visible.map((item)=>{
-    const row=document.createElement('div');row.className='recovery-item legacy-item';
-    const text=document.createElement('span');const classification=item.classification.replaceAll('-',' ');text.textContent=`${item.provider_id}: ${classification} — ${item.reason}`;row.append(text);
-    if(item.reconciliation){const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Reconciliation details';const body=document.createElement('p');body.className='muted-text';body.textContent=`Confirmed ${new Date(item.reconciliation.reconciled_at).toLocaleString()} · ${String(item.reconciliation.fingerprint).slice(0,12)} · ${item.reconciliation.resource_count} resources · ${item.reconciliation.quarantine_path}`;details.append(summary,body);row.append(details);}
-    if(item.migration_available){const button=document.createElement('button');button.className='btn';button.textContent='Copy into matched deployment runtime';button.onclick=async()=>{if(confirm('Create a timestamped runtime backup and copy this state into its uniquely matched deployment? The original will remain unchanged.')){try{await api().migrate_legacy_state(item.provider_id);await loadLegacyStates();await loadRecovery();}catch(e){alert(e.message);}}};row.append(button);}
-    if(item.stale_reconciliation_available){const button=document.createElement('button');button.className='btn';button.textContent='Mark stale — cloud absence confirmed';button.onclick=()=>reconcileStale(item);row.append(button);}
-    return row;
-  })); updateRecoveryVisibility();setBusy(false);
-}
-function updateRecoveryVisibility(){
-  const hasLegacy=legacyStates.some((item)=>item.blocking);
+  }
+  async function verifyLegacyCloud(item){
+    const buttonText='Verify cloud state';
+    if(!confirm(`Run read-only ${item.provider_id} queries for the exact resource IDs in this legacy state? No cloud resources or Terraform state will be modified.`))return;
+    try{
+      const result=await api().verify_legacy_cloud_state(item.provider_id);
+      await loadLegacyStates();
+      if(result.status==='all_absent')alert('No legacy cloud resources were found. Review and explicitly reconcile the preserved state.');
+      else alert(result.message||'Legacy cloud verification was inconclusive.');
+    }catch(e){alert(e.message||buttonText);await loadLegacyStates();}
+  }
+  function renderLegacyStates(){
+    const visible=selectedLegacyBlockers();
+    $('legacy-warning').classList.toggle('hidden',!visible.length);
+    $('legacy-tools').classList.toggle('hidden',!visible.length);
+    $('legacy-list').replaceChildren(...visible.map((item)=>{
+      const row=document.createElement('div');row.className='recovery-item legacy-item';
+      const text=document.createElement('span');const classification=item.classification.replaceAll('-',' ');text.textContent=`${item.provider_id}: ${classification} — ${item.reason}`;row.append(text);
+      const verification=item.cloud_verification;
+      if(verification){const status=document.createElement('span');status.className='muted-text';status.textContent=verification.message||`Cloud verification: ${verification.status}`;row.append(status);}
+      if(item.reconciliation){const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Reconciliation details';const body=document.createElement('p');body.className='muted-text';body.textContent=`Confirmed ${new Date(item.reconciliation.reconciled_at).toLocaleString()} · ${String(item.reconciliation.fingerprint).slice(0,12)} · ${item.reconciliation.resource_count} resources · ${item.reconciliation.quarantine_path}`;details.append(summary,body);row.append(details);}
+      if(item.migration_available){const button=document.createElement('button');button.className='btn';button.textContent='Copy into matched deployment runtime';button.onclick=async()=>{if(confirm('Create a timestamped runtime backup and copy this state into its uniquely matched deployment? The original will remain unchanged.')){try{await api().migrate_legacy_state(item.provider_id);await loadLegacyStates();await loadRecovery();}catch(e){alert(e.message);}}};row.append(button);}
+      if(item.cloud_verification_available&&!item.stale_reconciliation_available){const button=document.createElement('button');button.className='btn';button.textContent='Verify cloud state';button.onclick=()=>verifyLegacyCloud(item);row.append(button);}
+      if(item.stale_reconciliation_available){const button=document.createElement('button');button.className='btn';button.textContent='Mark stale and reconcile';button.onclick=()=>reconcileStale(item);row.append(button);}
+      return row;
+    }));
+    updateRecoveryVisibility();setBusy(false);
+  }
+  async function loadLegacyStates(){
+    legacyStates=await api().list_legacy_states();renderLegacyStates();
+  }
+  function updateRecoveryVisibility(){
+    const hasLegacy=selectedLegacyBlockers().length>0;
   $('recovery').classList.toggle('hidden',!recoveryItems.length&&!hasLegacy);
   $('recovery-summary').textContent=recoveryItems.length?'These deployments may still own billable resources.':'Resolve the blocking infrastructure state before creating a gateway.';
 }
@@ -219,7 +237,7 @@ async function validateCredentials(){
   try{renderCredentialFeedback(await api().validate_credentials(providerId),providerId);}finally{$('validate-credentials').disabled=uiBusy;}
 }
 async function initialize(){ if(!api()){setTimeout(initialize,100);return;} providers=await api().list_providers(); $('provider').replaceChildren(); providers.forEach((p)=>option($('provider'),p.id,p.display_name)); refreshLocations(); renderSteps('idle'); startTimer(); await loadLegacyStates(); await loadRecovery(); setInterval(()=>{if(!document.hidden)reconcileCurrentDeployment().catch(()=>{});},1000); setInterval(()=>{if(!document.hidden)loadRecovery().catch(()=>{});},5000); }
-$('provider').addEventListener('change',()=>{clearCredentialFeedback();refreshLocations();setBusy(false);}); $('country').addEventListener('change',refreshRegions); $('location').addEventListener('change',refreshBadges);
+  $('provider').addEventListener('change',()=>{clearCredentialFeedback();refreshLocations();renderLegacyStates();setBusy(false);}); $('country').addEventListener('change',refreshRegions); $('location').addEventListener('change',refreshBadges);
 $('deploy').addEventListener('click',()=>deploy().catch((e)=>{alert(e.message);setBusy(Boolean(operationId||activeDeploymentId));})); $('validate-credentials').addEventListener('click',()=>validateCredentials().catch((e)=>alert(e.message))); $('destroy').addEventListener('click',destroy); $('remove-local').addEventListener('click',removeLocal); $('cancel').addEventListener('click',async()=>{if(deploymentId)await api().cancel(deploymentId);});
 $('copy-ip').addEventListener('click',()=>navigator.clipboard.writeText($('ip-address').textContent)); $('save-config').addEventListener('click',()=>saveConfig());
 $('open-recovery').addEventListener('click',()=>{$('legacy-tools').open=true;$('recovery').scrollIntoView({behavior:'smooth',block:'start'});});

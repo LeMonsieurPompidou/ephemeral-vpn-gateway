@@ -83,6 +83,22 @@ def test_cloud_init_progress_label_uses_safe_persisted_backend_fields() -> None:
     }
 
 
+def test_legacy_blockers_are_scoped_to_the_selected_provider() -> None:
+    script = (
+        "const items=["
+        "{provider_id:'digitalocean',blocking:true},"
+        "{provider_id:'scaleway',blocking:true},"
+        "{provider_id:'aws-lightsail',blocking:false}];"
+        "const result={"
+        "aws:state.blockingLegacyStatesForProvider(items,'aws-lightsail').length,"
+        "do:state.blockingLegacyStatesForProvider(items,'digitalocean').length,"
+        "scw:state.blockingLegacyStatesForProvider(items,'scaleway').length,"
+        "invalid:state.blockingLegacyStatesForProvider(null,'digitalocean').length"
+        "};process.stdout.write(JSON.stringify(result));"
+    )
+    assert run_recovery_state(script) == {"aws": 0, "do": 1, "scw": 1, "invalid": 0}
+
+
 def test_client_configuration_ui_shows_backend_desktop_path_and_preserves_qr() -> None:
     index = (ROOT / "vpn-gui-app" / "ui" / "index.html").read_text(encoding="utf-8")
     script = (ROOT / "vpn-gui-app" / "ui" / "script.js").read_text(encoding="utf-8")
@@ -110,7 +126,7 @@ def test_normal_gui_hides_internal_advanced_controls_and_healthy_legacy_states()
         assert f"$('{internal_id}')" not in script
     assert "allowed_ips:" not in script
     assert "wireguard_port:" not in script
-    assert "legacyStates.filter((item)=>item.blocking)" in script
+    assert "selectedLegacyBlockers()" in script
     assert "classification!=='none'" not in script
     assert "Legacy Terraform state requires attention" not in index
     assert 'id="legacy-recovery"' not in index
@@ -119,6 +135,10 @@ def test_normal_gui_hides_internal_advanced_controls_and_healthy_legacy_states()
     assert 'id="legacy-tools"' in index and "Legacy Terraform recovery" in index
     assert "$('legacy-warning').classList.toggle('hidden',!visible.length)" in script
     assert "providerBlocked()" in script
+    assert "Verify cloud state" in script
+    assert "Mark stale and reconcile" in script
+    assert "verify_legacy_cloud_state(item.provider_id)" in script
+    assert "RecoveryState.blockingLegacyStatesForProvider" in script
 
 
 def test_lifetime_and_client_count_use_top_aligned_equal_height_form_fields() -> None:

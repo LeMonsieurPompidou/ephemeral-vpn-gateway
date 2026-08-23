@@ -50,5 +50,10 @@
     return `Cloud init: ${phase} (${minutes}m${seconds}s)`;
   }
 
-  return { acceptsBackendRecord, canRenderLogs, cloudInitStatus, selectionAfterRefresh };
+  function blockingLegacyStatesForProvider(items, providerId) {
+    if (!Array.isArray(items) || typeof providerId !== 'string') return [];
+    return items.filter((item) => item && item.provider_id === providerId && item.blocking === true);
+  }
+
+  return { acceptsBackendRecord, blockingLegacyStatesForProvider, canRenderLogs, cloudInitStatus, selectionAfterRefresh };
 });
