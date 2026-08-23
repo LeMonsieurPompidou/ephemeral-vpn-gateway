@@ -22,6 +22,22 @@ def test_subprocess_output_is_decoded_as_utf8(tmp_path: Path) -> None:
     assert result.stdout == "│ ╵\n"
 
 
+def test_provider_environment_is_inherited_without_being_added_to_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DIGITALOCEAN_TOKEN", "unit-test-token-never-log")
+    runner = TerraformRunner(executable=sys.executable)
+    result = runner.run(
+        [
+            "-c",
+            "import os; print('inherited' if os.getenv('DIGITALOCEAN_TOKEN') else 'missing')",
+        ],
+        tmp_path,
+    )
+    assert result.stdout == "inherited\n"
+    assert "unit-test-token-never-log" not in result.stdout
+
+
 def test_timeout(tmp_path: Path) -> None:
     runner = TerraformRunner(executable=sys.executable, timeout=0.1)
     with pytest.raises(TerraformError, match="timed out"):

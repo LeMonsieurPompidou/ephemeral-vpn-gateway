@@ -112,6 +112,46 @@ def test_normal_gui_hides_internal_advanced_controls_and_healthy_legacy_states()
     assert "wireguard_port:" not in script
     assert "legacyStates.filter((item)=>item.blocking)" in script
     assert "classification!=='none'" not in script
+    assert "Legacy Terraform state requires attention" not in index
+    assert 'id="legacy-recovery"' not in index
+    assert 'id="legacy-warning"' in index
+    assert "Deployment recovery is required before creating a new gateway." in index
+    assert 'id="legacy-tools"' in index and "Legacy Terraform recovery" in index
+    assert "$('legacy-warning').classList.toggle('hidden',!visible.length)" in script
+    assert "providerBlocked()" in script
+
+
+def test_lifetime_and_client_count_use_top_aligned_equal_height_form_fields() -> None:
+    index = (ROOT / "vpn-gui-app" / "ui" / "index.html").read_text(encoding="utf-8")
+    style = (ROOT / "vpn-gui-app" / "ui" / "style.css").read_text(encoding="utf-8")
+    assert '<span class="field-label">Lifetime</span><select id="expiration" class="form-control">' in index
+    assert '<span class="field-label">VPN clients</span><input id="client-count" class="form-control"' in index
+    assert '<span class="field-helper">One client per device.</span>' in index
+    assert ".form-grid {" in style and "align-items: start" in style
+    assert ".form-field {" in style and "align-self: start" in style
+    assert ".form-control {" in style and "height: 42px" in style and "min-height: 42px" in style
+    assert ".field-helper {" in style
+
+
+def test_provider_credential_feedback_is_compact_provider_bound_and_secret_safe() -> None:
+    index = (ROOT / "vpn-gui-app" / "ui" / "index.html").read_text(encoding="utf-8")
+    script = (ROOT / "vpn-gui-app" / "ui" / "script.js").read_text(encoding="utf-8")
+    assert 'id="credential-feedback"' in index
+    assert 'id="credential-help" class="hidden"' in index
+    assert "result.provider_id!==expectedProvider" in script
+    assert "result.reason==='missing'" in script
+    assert "textContent=command" in script
+    assert "alert(result.message)" not in script
+    assert "DIGITALOCEAN_TOKEN" not in index
+    assert "SCW_SECRET_KEY" not in index
+
+
+def test_destroyed_record_can_show_separate_local_export_cleanup_warning() -> None:
+    index = (ROOT / "vpn-gui-app" / "ui" / "index.html").read_text(encoding="utf-8")
+    script = (ROOT / "vpn-gui-app" / "ui" / "script.js").read_text(encoding="utf-8")
+    assert 'id="local-cleanup-warning"' in index
+    assert "currentRecord.local_cleanup_warnings" in script
+    assert "cleanupWarnings.join('\\n')" in script
 
 
 def test_running_time_and_estimated_cost_are_present_and_driven_locally() -> None:

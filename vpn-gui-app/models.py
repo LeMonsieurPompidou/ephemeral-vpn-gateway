@@ -106,6 +106,16 @@ class ClientMetadata:
 
 
 @dataclass
+class ClientExportMetadata:
+    client_id: str
+    path: str
+    sha256: str
+    exported_at: str
+    cleanup_status: str = "tracked"
+    cleaned_at: str | None = None
+
+
+@dataclass
 class DeploymentRecord:
     id: str
     provider_id: str
@@ -137,6 +147,9 @@ class DeploymentRecord:
     legacy_backup_path: str | None = None
     client_schema_version: int = 0
     clients: list[ClientMetadata] = field(default_factory=list)
+    client_exports: list[ClientExportMetadata] = field(default_factory=list)
+    local_cleanup_status: str = "not_required"
+    local_cleanup_warnings: list[str] = field(default_factory=list)
     estimated_hourly_cost_usd: float | None = None
     updated_at: str = field(default_factory=lambda: now_iso())
 
@@ -156,6 +169,15 @@ class DeploymentRecord:
         copy["clients"] = [ClientMetadata(**item) for item in clients if isinstance(item, dict)]
         if len(copy["clients"]) != len(clients):
             raise ValueError("Deployment client metadata is malformed")
+        exports = copy.get("client_exports", [])
+        if not isinstance(exports, list):
+            raise ValueError("Deployment client export metadata is malformed")
+        copy["client_exports"] = [ClientExportMetadata(**item) for item in exports if isinstance(item, dict)]
+        if len(copy["client_exports"]) != len(exports):
+            raise ValueError("Deployment client export metadata is malformed")
+        warnings = copy.get("local_cleanup_warnings", [])
+        if not isinstance(warnings, list) or not all(isinstance(item, str) for item in warnings):
+            raise ValueError("Deployment local cleanup metadata is malformed")
         allowed = {field.name for field in __import__("dataclasses").fields(cls)}
         return cls(**{key: item for key, item in copy.items() if key in allowed})
 

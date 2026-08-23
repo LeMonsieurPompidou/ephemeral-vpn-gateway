@@ -65,13 +65,19 @@ def test_onedrive_desktop_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert resolve_desktop_directory() == desktop.resolve()
 
 
-def test_default_filename_and_proposal_are_safe() -> None:
+@pytest.mark.parametrize("index", range(1, 11))
+def test_default_filename_and_proposal_are_simple_ascii(index: int) -> None:
     desktop = Path("C:/Users/example/Desktop")
-    filename = default_config_filename("../../US East 1", "a01784ba-a00f-4a53-8f98-557e69bee8f2")
-    assert filename == "heres-vpn-us-east-1-a01784ba.conf"
-    assert proposed_export_path(desktop, "../../US East 1", "a01784ba-a00f-4a53-8f98-557e69bee8f2") == (
-        desktop / filename
-    )
+    filename = default_config_filename(f"client-{index}")
+    assert filename == f"HeresVPN{index}.conf"
+    assert filename.removesuffix(".conf").isalnum() and filename.isascii()
+    assert proposed_export_path(desktop, f"client-{index}") == desktop / filename
+
+
+@pytest.mark.parametrize("client_id", ["client-0", "client-11", "../client-1", "Client-1"])
+def test_default_filename_rejects_invalid_client_identity(client_id: str) -> None:
+    with pytest.raises(ConfigExportError, match="identity"):
+        default_config_filename(client_id)
 
 
 def test_export_proposal_uses_backend_desktop_without_touching_runtime(
@@ -86,8 +92,8 @@ def test_export_proposal_uses_backend_desktop_without_touching_runtime(
         "deployment_id": record.id,
         "client_id": "client-1",
         "directory": str(desktop),
-        "filename": "heres-vpn-us-east-1-a01784ba.conf",
-        "path": str(desktop / "heres-vpn-us-east-1-a01784ba.conf"),
+        "filename": "HeresVPN1.conf",
+        "path": str(desktop / "HeresVPN1.conf"),
     }
     assert source.read_bytes() == before == payload
     assert not (desktop / proposal["filename"]).exists()
@@ -105,12 +111,12 @@ def test_native_save_dialog_receives_directory_filename_and_filter(monkeypatch: 
     fake_webview = SimpleNamespace(windows=[Window()], FileDialog=SimpleNamespace(SAVE=30))
     monkeypatch.setitem(sys.modules, "webview", fake_webview)
     desktop = Path("C:/Users/example/Desktop")
-    selected = native_save_dialog(desktop, "heres-vpn-us-east-1-a01784ba.conf")
-    assert selected == desktop / "heres-vpn-us-east-1-a01784ba.conf"
+    selected = native_save_dialog(desktop, "HeresVPN1.conf")
+    assert selected == desktop / "HeresVPN1.conf"
     assert captured == {
         "dialog_type": 30,
         "directory": str(desktop),
-        "save_filename": "heres-vpn-us-east-1-a01784ba.conf",
+        "save_filename": "HeresVPN1.conf",
         "file_types": ("WireGuard configuration (*.conf)",),
     }
 
@@ -131,19 +137,24 @@ def test_save_exports_identical_bytes_to_selected_path_with_spaces(
     source_before = source.read_bytes()
     result = bridge.save_client_config(record.id)
     destination = chosen.with_suffix(".conf")
-    assert calls == [(desktop, "heres-vpn-us-east-1-a01784ba.conf")]
+    assert calls == [(desktop, "HeresVPN1.conf")]
     assert result == {"status": "success", "path": str(destination)}
     assert destination.read_bytes() == payload
     assert source.read_bytes() == source_before
+    tracked = bridge.orchestrator.deployments.get(record.id).client_exports
+    assert len(tracked) == 1
+    assert tracked[0].client_id == "client-1" and tracked[0].path == str(destination.resolve())
+    assert len(tracked[0].sha256) == 64
 
 
 def test_user_cancel_does_not_create_an_export(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     bridge, record, desktop, payload = ready_bridge(tmp_path, monkeypatch, save_dialog=lambda *_args: None)
     result = bridge.save_client_config(record.id)
     assert result["status"] == "cancelled"
-    assert result["path"] == str(desktop / "heres-vpn-us-east-1-a01784ba.conf")
+    assert result["path"] == str(desktop / "HeresVPN1.conf")
     assert list(desktop.iterdir()) == []
     assert (Path(record.runtime_directory) / "client.conf").read_bytes() == payload
+    assert bridge.orchestrator.deployments.get(record.id).client_exports == []
 
 
 def test_existing_destination_is_atomically_replaced_after_dialog_confirmation(
@@ -183,7 +194,7 @@ def test_export_default_is_independent_of_source_or_packaged_working_directory(
     for working in (tmp_path / "repository" / "vpn-gui-app", tmp_path / "dist"):
         working.mkdir(parents=True)
         monkeypatch.chdir(working)
-        assert bridge.get_client_config_export(record.id)["path"] == str(desktop / "heres-vpn-us-east-1-a01784ba.conf")
+        assert bridge.get_client_config_export(record.id)["path"] == str(desktop / "HeresVPN1.conf")
 
 
 def test_symlinked_runtime_source_is_rejected_before_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -268,8 +279,8 @@ def test_multiple_clients_have_independent_desktop_names_and_exports(
     second = bridge.get_client_config_export(record.id, "client-2")
     with pytest.raises(RuntimeError, match="Unknown deployment client"):
         bridge.get_client_config_export(record.id, "client-3")
-    assert first["filename"] == "heres-vpn-us-east-1-a01784ba-client-1.conf"
-    assert second["filename"] == "heres-vpn-us-east-1-a01784ba-client-2.conf"
+    assert first["filename"] == "HeresVPN1.conf"
+    assert second["filename"] == "HeresVPN2.conf"
     assert first["path"] == str(desktop / first["filename"])
     assert second["path"] == str(desktop / second["filename"])
     assert bridge.save_client_config(record.id, "client-1")["status"] == "success"

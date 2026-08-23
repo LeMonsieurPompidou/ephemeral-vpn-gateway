@@ -26,9 +26,18 @@ from client_peers import (
     validate_client_count,
 )
 from cloud_init import FAILURE_MARKER, READINESS_MARKER, bootstrap_source_sha256, render_user_data
+from config_export import ConfigExportError, regular_file_sha256, remove_tracked_config
 from file_lock import FileLock
 from legacy_reconciliation import LegacyReconciliationStore
-from models import ClientMetadata, DeploymentOptions, DeploymentRecord, DeploymentState, StatusEvent, now_iso
+from models import (
+    ClientExportMetadata,
+    ClientMetadata,
+    DeploymentOptions,
+    DeploymentRecord,
+    DeploymentState,
+    StatusEvent,
+    now_iso,
+)
 from networking import PublicIpDetectionError, detect_public_ipv4, normalize_public_ipv4_cidr
 from output_contract import ProviderOutputs, validate_provider_outputs
 from providers import ProviderRegistry
@@ -170,8 +179,8 @@ class Orchestrator:
         return [location.to_dict() for location in self.providers.get(provider_id).list_locations()]
 
     def validate_credentials(self, provider_id: str) -> dict[str, object]:
-        valid, message = self.providers.get(provider_id).validate_credentials()
-        return {"valid": valid, "message": message}
+        result = self.providers.get(provider_id).credential_details()
+        return {"provider_id": provider_id, **result.to_dict()}
 
     def initialize(self, provider_id: str, deployment_id: str | None = None) -> dict[str, object]:
         provider = self.providers.get(provider_id)
@@ -317,13 +326,8 @@ class Orchestrator:
             self._raise_if_cancelled(cancel)
             valid, message = provider.validate_credentials(cancel)
             self._raise_if_cancelled(cancel)
-            legacy_tfvars = terraform_directory / "terraform.tfvars"
-            if not valid and (provider_id == "aws-lightsail" or not legacy_tfvars.is_file()):
-                raise ValueError(message)
             if not valid:
-                self._log(
-                    identifier, "Using legacy terraform.tfvars credentials; migrate to provider environment variables"
-                )
+                raise ValueError(message)
 
             server_private, server_public = generate_wireguard_keypair()
             client_peers = generate_client_peers(options.client_count, generate_wireguard_keypair)
@@ -339,7 +343,7 @@ class Orchestrator:
             self.deployments.save(record)
             self._raise_if_cancelled(cancel)
 
-            self._stage_terraform_configuration(record)
+            self._stage_terraform_configuration(record, include_legacy_tfvars=True)
             env = self._terraform_env(record)
             with self._provider_operation_lock(provider_id, terraform_directory):
                 self._transition(
@@ -1058,7 +1062,7 @@ class Orchestrator:
             directory = Path(record.terraform_directory)
             with self._provider_operation_lock(record.provider_id, directory):
                 self._validate_recovery_backend(record, env)
-                self._stage_terraform_configuration(record)
+                self._stage_terraform_configuration(record, include_legacy_tfvars=True)
                 self._initialize_terraform_backend(record, env=env, cancel=cancel, fresh=False)
                 self._run_terraform(
                     record,
@@ -1070,13 +1074,21 @@ class Orchestrator:
             record.state_present = False
             record.cleanup_status = "destroyed"
             record.destroyed_at = now_iso()
+            self._cleanup_exported_configs(record)
             self._cleanup_after_destroy(record, preserve_config=preserve_config)
             record.public_ip = None
             record.resource_ids = {}
             record.last_error = None
             record.legacy_backup_path = None
-            self._transition(record, DeploymentState.DESTROYED, "Deployment destroyed and sensitive artifacts removed")
-            return {"status": "success", "deployment_id": deployment_id}
+            message = "Deployment destroyed and sensitive artifacts removed"
+            if record.local_cleanup_warnings:
+                message = "Deployment destroyed; one or more exported configurations require manual deletion"
+            self._transition(record, DeploymentState.DESTROYED, message)
+            return {
+                "status": "success",
+                "deployment_id": deployment_id,
+                "local_cleanup_warnings": list(record.local_cleanup_warnings),
+            }
         except Exception as exc:
             record.state_present = state_path.is_file()
             record.resources_possible = True
@@ -1123,6 +1135,31 @@ class Orchestrator:
 
     def get_client_config(self, deployment_id: str, client_id: str | None = None) -> str:
         return self.client_config_path(deployment_id, client_id).read_text(encoding="utf-8")
+
+    def record_client_export(self, deployment_id: str, client_id: str, path: Path, sha256: str) -> None:
+        record = self.deployments.get(deployment_id)
+        self._assert_record_paths(record)
+        if record.state != DeploymentState.READY:
+            raise RuntimeError("Client configurations can be exported only while the deployment is ready")
+        source = self.client_config_path(deployment_id, client_id)
+        authoritative_sha256 = regular_file_sha256(source)
+        if sha256 != authoritative_sha256 or not path.is_absolute():
+            raise RuntimeError("Exported configuration provenance could not be verified")
+        resolved = path.parent.resolve(strict=True) / path.name
+        if regular_file_sha256(resolved) != sha256:
+            raise RuntimeError("Exported configuration changed before it could be recorded")
+        record.client_exports = [item for item in record.client_exports if Path(item.path) != resolved]
+        record.client_exports.append(
+            ClientExportMetadata(
+                client_id=client_id,
+                path=str(resolved),
+                sha256=sha256,
+                exported_at=now_iso(),
+            )
+        )
+        record.local_cleanup_status = "pending"
+        record.local_cleanup_warnings = []
+        self.deployments.save(record)
 
     def client_config_path(self, deployment_id: str, client_id: str | None = None) -> Path:
         record = self.deployments.get(deployment_id)
@@ -1773,7 +1810,12 @@ class Orchestrator:
             raise TerraformError("Terraform working directory is outside the deployment runtime")
         return working
 
-    def _stage_terraform_configuration(self, record: DeploymentRecord) -> Path:
+    def _stage_terraform_configuration(
+        self,
+        record: DeploymentRecord,
+        *,
+        include_legacy_tfvars: bool = False,
+    ) -> Path:
         self._assert_record_paths(record)
         runtime = Path(record.runtime_directory).resolve()
         source = Path(record.terraform_directory).resolve()
@@ -1790,7 +1832,7 @@ class Orchestrator:
             raise TerraformError("Terraform provider dependency lockfile is missing")
         source_files.append(lock_file)
         legacy_tfvars = source / "terraform.tfvars"
-        if legacy_tfvars.is_file():
+        if include_legacy_tfvars and legacy_tfvars.is_file():
             source_files.append(legacy_tfvars)
         common_source = self.resource_root / "terraform-common"
         common_files = sorted(path for path in common_source.rglob("*") if path.is_file())
@@ -2193,6 +2235,37 @@ class Orchestrator:
         if terraform_work.is_dir():
             shutil.rmtree(terraform_work)
         (runtime / TERRAFORM_WORK_MANIFEST).unlink(missing_ok=True)
+
+    def _cleanup_exported_configs(self, record: DeploymentRecord) -> None:
+        """Best-effort cleanup bound to exact client content and recorded destinations."""
+        if not record.client_exports:
+            record.local_cleanup_status = "not_required"
+            record.local_cleanup_warnings = []
+            return
+        warnings: list[str] = []
+        authoritative: dict[str, str] = {}
+        cleaned_at = now_iso()
+        for exported in record.client_exports:
+            if exported.cleanup_status in {"deleted", "missing"}:
+                continue
+            try:
+                if exported.client_id not in authoritative:
+                    source = self.client_config_path(record.id, exported.client_id)
+                    authoritative[exported.client_id] = regular_file_sha256(source)
+                result = remove_tracked_config(
+                    Path(exported.path),
+                    exported.sha256,
+                    authoritative[exported.client_id],
+                )
+                exported.cleanup_status = result
+                exported.cleaned_at = cleaned_at
+            except (ConfigExportError, OSError, RuntimeError) as exc:
+                exported.cleanup_status = "warning"
+                exported.cleaned_at = cleaned_at
+                safe_path = redact(exported.path).replace("\r", "?").replace("\n", "?")
+                warnings.append(f"Delete exported VPN configuration manually: {safe_path} ({redact(str(exc))})")
+        record.local_cleanup_warnings = warnings
+        record.local_cleanup_status = "warning" if warnings else "complete"
 
     def _transition(
         self, record: DeploymentRecord, state: DeploymentState, message: str, error: str | None = None

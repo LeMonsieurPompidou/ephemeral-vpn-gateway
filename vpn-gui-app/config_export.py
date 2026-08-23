@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import hmac
 import os
 import re
 import stat
@@ -9,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 _DESKTOP_FOLDER_ID = uuid.UUID("b4bfcc3a-db2c-424c-b029-7fe99a87c641")
-_SAFE_COMPONENT = re.compile(r"[^a-z0-9]+")
+_CLIENT_ID = re.compile(r"client-([1-9]|10)\Z")
 
 
 class ConfigExportError(RuntimeError):
@@ -81,42 +83,20 @@ def resolve_desktop_directory() -> Path:
     return home.resolve()
 
 
-def _slug(value: str, *, fallback: str, maximum: int = 48) -> str:
-    normalized = _SAFE_COMPONENT.sub("-", value.lower()).strip("-")
-    return normalized[:maximum].rstrip("-") or fallback
-
-
-def default_config_filename(
-    location_id: str,
-    deployment_id: str,
-    client_id: str | None = None,
-    *,
-    total_clients: int = 1,
-) -> str:
-    location = _slug(location_id, fallback="location")
-    short_id = _slug(deployment_id, fallback="deployment", maximum=8)
-    client_suffix = ""
-    if total_clients > 1:
-        client_suffix = f"-{_slug(client_id or 'client', fallback='client', maximum=24)}"
-    return f"heres-vpn-{location}-{short_id}{client_suffix}.conf"
+def default_config_filename(client_id: str | None = None) -> str:
+    match = _CLIENT_ID.fullmatch(client_id or "client-1")
+    if match is None:
+        raise ConfigExportError("VPN client identity is invalid")
+    return f"HeresVPN{match.group(1)}.conf"
 
 
 def proposed_export_path(
     desktop: Path,
-    location_id: str,
-    deployment_id: str,
     client_id: str | None = None,
-    *,
-    total_clients: int = 1,
 ) -> Path:
     if not desktop.is_absolute():
         raise ConfigExportError("Desktop directory must be absolute")
-    return desktop / default_config_filename(
-        location_id,
-        deployment_id,
-        client_id,
-        total_clients=total_clients,
-    )
+    return desktop / default_config_filename(client_id)
 
 
 def normalize_export_destination(value: str | Path) -> Path:
@@ -139,7 +119,7 @@ def normalize_export_destination(value: str | Path) -> Path:
     return normalized
 
 
-def copy_config_bytes(source: Path, destination: Path) -> None:
+def copy_config_bytes(source: Path, destination: Path) -> str:
     """Atomically copy the authoritative runtime bytes to an explicit destination."""
     try:
         source_identity = source.stat(follow_symlinks=False)
@@ -185,3 +165,62 @@ def copy_config_bytes(source: Path, destination: Path) -> None:
     except OSError as exc:
         temporary.unlink(missing_ok=True)
         raise ConfigExportError("Configuration could not be saved to the selected destination") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def regular_file_sha256(path: Path) -> str:
+    """Hash one exact regular file without following a symbolic link."""
+    try:
+        before = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ConfigExportError("Tracked configuration is missing or unsafe") from exc
+    if not stat.S_ISREG(before.st_mode) or path.is_symlink():
+        raise ConfigExportError("Tracked configuration is not a regular file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    digest = hashlib.sha256()
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise ConfigExportError("Tracked configuration changed before verification")
+            for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                digest.update(chunk)
+    except ConfigExportError:
+        raise
+    except OSError as exc:
+        raise ConfigExportError("Tracked configuration could not be verified") from exc
+    after = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise ConfigExportError("Tracked configuration changed during verification")
+    return digest.hexdigest()
+
+
+def remove_tracked_config(path: Path, recorded_sha256: str, authoritative_sha256: str) -> str:
+    """Remove a proven export, refusing paths whose content or type changed."""
+    if not path.is_absolute() or not re.fullmatch(r"[0-9a-f]{64}", recorded_sha256):
+        raise ConfigExportError("Tracked configuration provenance is invalid")
+    if not hmac.compare_digest(recorded_sha256, authoritative_sha256):
+        raise ConfigExportError("Tracked configuration no longer matches its deployment client")
+    try:
+        current_sha256 = regular_file_sha256(path)
+    except ConfigExportError as exc:
+        if not path.exists() and not path.is_symlink():
+            return "missing"
+        raise exc
+    if not hmac.compare_digest(current_sha256, recorded_sha256):
+        raise ConfigExportError("Tracked configuration content changed after export")
+    before = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or path.is_symlink():
+        raise ConfigExportError("Tracked configuration is not a regular file")
+    path.unlink()
+    return "deleted"

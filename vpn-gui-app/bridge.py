@@ -216,23 +216,16 @@ class BridgeService:
             return self._logs.get(deployment_id, [])[-250:]
 
     def get_client_config_export(self, deployment_id: str, client_id: str | None = None) -> dict[str, str]:
-        record = self.orchestrator.deployments.get(deployment_id)
         clients = self.orchestrator.list_client_configs(deployment_id)
         selected_id = client_id or str(clients[0]["id"])
         if selected_id not in {str(client["id"]) for client in clients}:
             raise RuntimeError("Unknown deployment client")
         self.orchestrator.client_config_path(deployment_id, selected_id)
         desktop = resolve_desktop_directory()
-        proposed = proposed_export_path(
-            desktop,
-            record.location_id,
-            record.id,
-            selected_id,
-            total_clients=len(clients),
-        )
+        proposed = proposed_export_path(desktop, selected_id)
         return {
             "status": "ready",
-            "deployment_id": record.id,
+            "deployment_id": deployment_id,
             "client_id": selected_id,
             "directory": str(desktop),
             "filename": proposed.name,
@@ -246,7 +239,8 @@ class BridgeService:
         if selected is None:
             return {"status": "cancelled", "path": proposal["path"]}
         destination_path = normalize_export_destination(selected)
-        copy_config_bytes(source, destination_path)
+        digest = copy_config_bytes(source, destination_path)
+        self.orchestrator.record_client_export(deployment_id, proposal["client_id"], destination_path, digest)
         return {"status": "success", "path": str(destination_path)}
 
     def _capture_log(self, deployment_id: str, line: str) -> None:

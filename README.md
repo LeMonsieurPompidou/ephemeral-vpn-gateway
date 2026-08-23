@@ -56,7 +56,7 @@ Provider operations also use an OS/filesystem lock. Registry replacement is atom
 
 Older versions could write ignored `terraform.tfstate` files into `vpn-aws-lightsail`, `vpn-digitalocean`, or `vpn-scaleway`. Startup inspects primary and backup files without changing them and classifies them as empty, active, malformed, ambiguous, or migrated.
 
-The GUI hides this internal recovery section when every provider is empty, validly migrated, or validly reconciled stale. It appears only when at least one provider has genuinely blocking legacy state.
+The Gateway form never shows the large technical legacy-state card. Empty, validly migrated, and validly reconciled-stale states are invisible. A genuinely blocking state produces only a compact **Deployment recovery is required** warning; the hashes, lineage, serial, migration, and stale-reconciliation controls are available only after opening **Recovery**.
 
 - Active, malformed, and ambiguous state blocks a new deployment for that provider.
 - The original state is never deleted, overwritten, moved, merged, or destroyed automatically.
@@ -88,12 +88,54 @@ aws sts get-caller-identity --profile heres-vpn --no-cli-pager
 
 Account details are not logged. An expired session produces an instruction to rerun `aws sso login --profile heres-vpn`. The UI's **Check credentials** action can be retried without restarting.
 
-### Other providers
+### DigitalOcean
 
-- DigitalOcean: `DIGITALOCEAN_TOKEN`
-- Scaleway: `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, and `SCW_DEFAULT_PROJECT_ID`
+The existing `main`-branch credential contract remains supported: an ignored
+`vpn-digitalocean/terraform.tfvars` may supply `do_token` (and the historical
+`ssh_key_name`). The deployment-scoped working copy receives a protected byte-for-byte
+copy, while the provider-root file remains unchanged.
 
-Ignored legacy `terraform.tfvars` credentials remain accepted for migration compatibility, although environment variables are preferred.
+Environment authentication is also supported. Use the canonical provider variable and
+launch Hérès from that PowerShell session:
+
+```powershell
+$env:DIGITALOCEAN_TOKEN = "<token>"
+.\.venv\Scripts\python.exe vpn-gui-app\app.py
+```
+
+`DIGITALOCEAN_ACCESS_TOKEN` is accepted as the Terraform provider's supported fallback,
+but Hérès consistently recommends `DIGITALOCEAN_TOKEN`. With environment credentials,
+**Check credentials** performs a bounded, read-only account request and distinguishes
+missing credentials, rejected/insufficient credentials, and network/API failure without
+logging the token. With `terraform.tfvars`, it confirms that the known-good variable is
+configured and reports that Terraform will perform the provider validation.
+
+### Scaleway
+
+The existing `main`-branch contract remains supported: an ignored
+`vpn-scaleway/terraform.tfvars` may supply `scaleway_access_key`,
+`scaleway_secret_key`, and `scaleway_project_id`. Alternatively, set the provider
+environment variables and launch Hérès from the same PowerShell session:
+
+```powershell
+$env:SCW_ACCESS_KEY = "<access-key>"
+$env:SCW_SECRET_KEY = "<secret-key>"
+$env:SCW_DEFAULT_PROJECT_ID = "<project-id>"
+.\.venv\Scripts\python.exe vpn-gui-app\app.py
+```
+
+The selected catalog location supplies the Scaleway zone and region explicitly, so `SCW_DEFAULT_ZONE` and `SCW_DEFAULT_REGION` are not required. **Check credentials** makes a bounded, read-only request for the configured Project. Missing-variable guidance names variables only; it never displays existing values.
+
+### Environment lifetime and packaged builds
+
+PowerShell `$env:...` assignments exist only in that process and its child processes. A source run or packaged executable started from the same terminal inherits them; an executable opened later by double-click from Explorer does not inherit an unrelated terminal's temporary environment. Either start the packaged executable from the configured terminal or deliberately configure Windows user environment variables outside Hérès, understanding that Windows then persists them for other processes owned by that user.
+
+Hérès never writes provider credentials to the registry or logs. Environment credentials
+remain in the inherited process environment. A user-created provider `terraform.tfvars`
+is git-ignored, copied only into the protected deployment runtime for Terraform, and
+removed with other sensitive runtime artifacts after confirmed destroy. Never commit a
+populated tfvars file.
+
 
 ## SSH readiness and source address
 
@@ -127,7 +169,7 @@ Do not delete state for a partial apply. If state is missing after apply may hav
 
 WireGuard server and client keypairs are generated locally with Python `cryptography` X25519. Users do not run `wg genkey`. Terraform receives the server private/public keys and a typed list containing each client's public key and `/32` tunnel address. It never receives a client private key. The server configuration contains one peer block per client.
 
-At Ready, select a client to display only that client's QR code and Desktop export. A single-client deployment keeps the backward-friendly `heres-vpn-<location>-<deployment>.conf` name. Multi-client exports add `-client-1`, `-client-2`, and so on. Windows resolves the real Desktop known folder, including redirected/OneDrive Desktops, before opening native Save As. The protected runtime copy remains authoritative.
+At Ready, select a client to display only that client's QR code and Desktop export. Export names are deliberately simple WireGuard tunnel names: `HeresVPN1.conf` through `HeresVPN10.conf`, independent of provider, location, or deployment. Windows resolves the real Desktop known folder, including redirected/OneDrive Desktops, before opening native Save As. The protected runtime copy remains authoritative.
 
 The status card estimates session cost from the catalog's numeric hourly estimate and elapsed time since `apply_started_at`. The timer freezes at confirmed `destroyed_at`; requesting destroy does not stop it. This is an estimate only: provider rounding, minimum charges, taxes, and other resources can make actual billing differ. Locations without verified pricing display **Unavailable**. No billing API is queried.
 
@@ -142,8 +184,9 @@ After Terraform confirms successful destruction, the application removes:
 - `.terraform`
 - WireGuard client secrets/configuration (unless explicitly preserved through the compatibility API)
 - the temporary SSH keypair and deployment `known_hosts`
+- every exact user export tracked for that deployment whose regular-file type and SHA-256 still match its authoritative client configuration
 
-Only sanitized tombstone metadata and the bounded redacted log remain. Failed destruction preserves all recovery-required material.
+The app never globs Desktop configuration files. A missing tracked export is considered already clean; a symlink, changed file, malformed provenance record, or mismatched hash is refused and shown as a separate manual local-cleanup warning without changing the successful cloud-destroy state. Failed destruction leaves exports and all recovery-required material untouched. Only sanitized tombstone/provenance metadata and the bounded redacted log remain.
 
 The provider selector contains only implemented Terraform providers: AWS Lightsail, DigitalOcean, and Scaleway. A user-owned residential exit remains a possible roadmap direction but is not offered as a deployable provider.
 

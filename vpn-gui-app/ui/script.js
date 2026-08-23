@@ -3,7 +3,7 @@ const $ = (id) => document.getElementById(id);
 let providers = [], locations = [], legacyStates = [], deploymentId = null, operationId = null;
 let activeDeploymentId = null, currentRecord = null, selectedRecoveryId = null, timer = null;
 let syncInFlight = false, uiBusy = false, configExportProposal = null;
-let clientMetadata = [], selectedClientId = null;
+let clientMetadata = [], selectedClientId = null, recoveryItems = [];
 const api = () => window.pywebview?.api;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -21,6 +21,8 @@ function setState(record, expectedId=deploymentId){
   const state=currentRecord.state||'idle'; $('status-text').textContent=RecoveryState.cloudInitStatus(currentRecord)||stateLabel(state); $('status-dot').className=`status-indicator ${state}`;
   $('ip-address').textContent=currentRecord.public_ip||'—'; $('copy-ip').disabled=!currentRecord.public_ip;
   $('expires').textContent=currentRecord.expires_at?new Date(currentRecord.expires_at).toLocaleString():'—';
+  const cleanupWarnings=Array.isArray(currentRecord.local_cleanup_warnings)?currentRecord.local_cleanup_warnings:[];
+  $('local-cleanup-warning').textContent=cleanupWarnings.join('\n');$('local-cleanup-warning').classList.toggle('hidden',!cleanupWarnings.length);
   updateSessionEstimate();
   updateActionButtons();
   renderSteps(state);
@@ -32,6 +34,7 @@ function resetDeploymentState(){
   $('status-text').textContent='Idle'; $('status-dot').className='status-indicator idle';
   $('ip-address').textContent='—'; $('copy-ip').disabled=true; $('expires').textContent='—';
   $('running-label').textContent='Running'; $('running-time').textContent='—'; $('estimated-cost').textContent='Unavailable';
+  $('local-cleanup-warning').textContent='';$('local-cleanup-warning').classList.add('hidden');
   $('destroy').disabled=true; $('remove-local').disabled=true; renderSteps('idle');
 }
 function refreshLocations(){ const provider=selectedProvider(); locations=provider?.locations||[]; const countries=[...new Map(locations.map((l)=>[l.country_code,l.country_name])).entries()]; $('country').replaceChildren(); countries.forEach(([id,name])=>option($('country'),id,name)); refreshRegions(); setBusy(false); }
@@ -43,7 +46,7 @@ function deploymentOptions(){
   return {client_count:clientCount,expiration_minutes:$('expiration').value?Number($('expiration').value):null,automatic_expiration:Boolean($('expiration').value)};
 }
 async function deploy(){
-  if(providerBlocked())throw new Error('This provider has unreconciled legacy Terraform state. Review the recovery warning first.');
+  if(providerBlocked())throw new Error('Deployment recovery is required before creating a new gateway. Open Recovery for the available actions.');
   if(operationId||activeDeploymentId)throw new Error('Another deployment operation is already active.');
   selectedRecoveryId=null;
   setBusy(true);
@@ -136,10 +139,11 @@ async function selectRecovery(item){
 }
 async function loadRecovery(){
   const items=await api().list_recovery_deployments();
+  recoveryItems=items;
   const refreshedSelection=RecoveryState.selectionAfterRefresh(selectedRecoveryId,items);
   if(!activeDeploymentId&&selectedRecoveryId&&refreshedSelection===null)resetDeploymentState();
   else if(!activeDeploymentId)selectedRecoveryId=refreshedSelection;
-  $('recovery').classList.toggle('hidden',!items.length);
+  updateRecoveryVisibility();
   $('recovery-list').replaceChildren(...items.map((item)=>{const button=document.createElement('button');button.className='recovery-item';button.disabled=Boolean(activeDeploymentId);button.textContent=`${item.provider_id} / ${item.location_id} — ${stateLabel(item.state)}`;button.onclick=()=>selectRecovery(item);return button;}));
 }
 async function reconcileCurrentDeployment(){
@@ -171,7 +175,8 @@ async function reconcileStale(item){
 }
 async function loadLegacyStates(){
   legacyStates=await api().list_legacy_states(); const visible=legacyStates.filter((item)=>item.blocking);
-  $('legacy-recovery').classList.toggle('hidden',!visible.length);
+  $('legacy-warning').classList.toggle('hidden',!visible.length);
+  $('legacy-tools').classList.toggle('hidden',!visible.length);
   $('legacy-list').replaceChildren(...visible.map((item)=>{
     const row=document.createElement('div');row.className='recovery-item legacy-item';
     const text=document.createElement('span');const classification=item.classification.replaceAll('-',' ');text.textContent=`${item.provider_id}: ${classification} — ${item.reason}`;row.append(text);
@@ -179,7 +184,12 @@ async function loadLegacyStates(){
     if(item.migration_available){const button=document.createElement('button');button.className='btn';button.textContent='Copy into matched deployment runtime';button.onclick=async()=>{if(confirm('Create a timestamped runtime backup and copy this state into its uniquely matched deployment? The original will remain unchanged.')){try{await api().migrate_legacy_state(item.provider_id);await loadLegacyStates();await loadRecovery();}catch(e){alert(e.message);}}};row.append(button);}
     if(item.stale_reconciliation_available){const button=document.createElement('button');button.className='btn';button.textContent='Mark stale — cloud absence confirmed';button.onclick=()=>reconcileStale(item);row.append(button);}
     return row;
-  })); setBusy(false);
+  })); updateRecoveryVisibility();setBusy(false);
+}
+function updateRecoveryVisibility(){
+  const hasLegacy=legacyStates.some((item)=>item.blocking);
+  $('recovery').classList.toggle('hidden',!recoveryItems.length&&!hasLegacy);
+  $('recovery-summary').textContent=recoveryItems.length?'These deployments may still own billable resources.':'Resolve the blocking infrastructure state before creating a gateway.';
 }
 function updateSessionEstimate(){
   const estimate=SessionCost.estimate(currentRecord,Date.now());
@@ -188,9 +198,29 @@ function updateSessionEstimate(){
   $('estimated-cost').textContent=SessionCost.formatCost(estimate.costUsd);
 }
 function startTimer(){clearInterval(timer);timer=setInterval(updateSessionEstimate,1000);updateSessionEstimate();}
-async function validateCredentials(){const result=await api().validate_credentials($('provider').value);alert(result.message);}
+function clearCredentialFeedback(){
+  $('credential-feedback').className='credential-feedback hidden';$('credential-message').textContent='';$('credential-help').classList.add('hidden');$('credential-help').open=false;$('credential-help-content').replaceChildren();
+}
+function renderCredentialFeedback(result,expectedProvider){
+  if(result.provider_id!==expectedProvider||$('provider').value!==expectedProvider)return;
+  const container=$('credential-feedback');container.className=`credential-feedback ${result.valid?'valid':'invalid'}`;$('credential-message').textContent=result.message;
+  const help=$('credential-help'),content=$('credential-help-content');content.replaceChildren();
+  if(result.reason==='missing'){
+    const missing=Array.isArray(result.missing_variables)?result.missing_variables:[];
+    if(missing.length){const label=document.createElement('span');label.textContent=`Missing: ${missing.join(', ')}`;content.append(label);}
+    for(const command of (result.setup_commands||[])){const code=document.createElement('code');code.className='credential-command';code.textContent=command;content.append(code);}
+    for(const note of (result.notes||[])){const text=document.createElement('span');text.className='muted-text';text.textContent=note;content.append(text);}
+    help.classList.remove('hidden');
+  }else help.classList.add('hidden');
+  container.classList.remove('hidden');
+}
+async function validateCredentials(){
+  const providerId=$('provider').value;clearCredentialFeedback();$('validate-credentials').disabled=true;
+  try{renderCredentialFeedback(await api().validate_credentials(providerId),providerId);}finally{$('validate-credentials').disabled=uiBusy;}
+}
 async function initialize(){ if(!api()){setTimeout(initialize,100);return;} providers=await api().list_providers(); $('provider').replaceChildren(); providers.forEach((p)=>option($('provider'),p.id,p.display_name)); refreshLocations(); renderSteps('idle'); startTimer(); await loadLegacyStates(); await loadRecovery(); setInterval(()=>{if(!document.hidden)reconcileCurrentDeployment().catch(()=>{});},1000); setInterval(()=>{if(!document.hidden)loadRecovery().catch(()=>{});},5000); }
-$('provider').addEventListener('change',()=>{refreshLocations();setBusy(false);}); $('country').addEventListener('change',refreshRegions); $('location').addEventListener('change',refreshBadges);
+$('provider').addEventListener('change',()=>{clearCredentialFeedback();refreshLocations();setBusy(false);}); $('country').addEventListener('change',refreshRegions); $('location').addEventListener('change',refreshBadges);
 $('deploy').addEventListener('click',()=>deploy().catch((e)=>{alert(e.message);setBusy(Boolean(operationId||activeDeploymentId));})); $('validate-credentials').addEventListener('click',()=>validateCredentials().catch((e)=>alert(e.message))); $('destroy').addEventListener('click',destroy); $('remove-local').addEventListener('click',removeLocal); $('cancel').addEventListener('click',async()=>{if(deploymentId)await api().cancel(deploymentId);});
 $('copy-ip').addEventListener('click',()=>navigator.clipboard.writeText($('ip-address').textContent)); $('save-config').addEventListener('click',()=>saveConfig());
+$('open-recovery').addEventListener('click',()=>{$('legacy-tools').open=true;$('recovery').scrollIntoView({behavior:'smooth',block:'start'});});
 window.addEventListener('beforeunload',(event)=>{if(currentRecord?.resources_possible&&currentRecord.state!=='destroyed'){event.preventDefault();event.returnValue='Active cloud resources may still exist.';}}); document.addEventListener('DOMContentLoaded',initialize);

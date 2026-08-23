@@ -11,17 +11,18 @@
   <section class="section">
     <h2 class="section-title">Gateway</h2>
     <div class="form-grid">
-      <label>Provider<select id="provider"></select></label>
-      <label>Country<select id="country"></select></label>
-      <label>City / region<select id="location"></select></label>
-      <label>Lifetime<select id="expiration"><option value="">Disabled</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="240">4 hours</option><option value="480">8 hours</option></select></label>
-      <label>VPN clients<input id="client-count" type="number" value="1" min="1" max="10" step="1"><span class="muted-text">One client per device.</span></label>
+      <label class="form-field"><span class="field-label">Provider</span><select id="provider" class="form-control"></select></label>
+      <label class="form-field"><span class="field-label">Country</span><select id="country" class="form-control"></select></label>
+      <label class="form-field"><span class="field-label">City / region</span><select id="location" class="form-control"></select></label>
+      <label class="form-field"><span class="field-label">Lifetime</span><select id="expiration" class="form-control"><option value="">Disabled</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="120">2 hours</option><option value="240">4 hours</option><option value="480">8 hours</option></select></label>
+      <label class="form-field"><span class="field-label">VPN clients</span><input id="client-count" class="form-control" type="number" value="1" min="1" max="10" step="1"><span class="field-helper">One client per device.</span></label>
     </div>
     <div class="badges"><span id="server-type" class="badge">cloud</span><span id="streaming" class="badge muted">unverified</span><span id="cost" class="badge muted">Estimated cost unavailable</span></div>
     <p class="muted-text">Lifetime cleanup is local and best-effort. It cannot run while this computer is off, the app is closed, or cloud credentials are unavailable.</p>
+    <div id="credential-feedback" class="credential-feedback hidden" role="status"><strong id="credential-message"></strong><details id="credential-help" class="hidden"><summary>Credential setup</summary><div id="credential-help-content"></div></details></div>
   </section>
-  <section id="legacy-recovery" class="section hidden"><h2 class="section-title">Legacy Terraform state requires attention</h2><p>Provider-root state is preserved and can block new deployments until it is reconciled.</p><div id="legacy-list"></div></section>
-  <section id="recovery" class="section hidden"><h2 class="section-title">Recovery</h2><p>These deployments may still own billable resources.</p><div id="recovery-list"></div></section>
+  <aside id="legacy-warning" class="compact-warning hidden" role="alert"><span>Deployment recovery is required before creating a new gateway.</span><button id="open-recovery" class="link-btn">Open recovery</button></aside>
+  <section id="recovery" class="section hidden"><h2 class="section-title">Recovery</h2><p id="recovery-summary">These deployments may still own billable resources.</p><div id="recovery-list"></div><details id="legacy-tools" class="legacy-tools hidden"><summary>Legacy Terraform recovery</summary><div id="legacy-list"></div></details></section>
   <section class="section actions"><button id="validate-credentials" class="btn">Check credentials</button><button id="deploy" class="btn btn-primary">Deploy VPN</button><button id="cancel" class="btn" disabled>Cancel local operation</button><button id="remove-local" class="btn" disabled>Remove local deployment</button><button id="destroy" class="btn btn-destructive" disabled>Destroy cloud resources</button></section>
   <section id="status-card" class="status-card">
     <div class="status-header"><div id="status-dot" class="status-indicator"></div><div><strong id="status-text">Idle</strong></div></div>
@@ -30,6 +31,7 @@
     <div class="status-row"><span id="running-label">Running</span><span id="running-time">—</span></div>
     <div class="status-row"><span title="Estimate based on provider hourly pricing. Actual billing may differ due to provider rounding, minimum charges, taxes, or other resources.">Estimated cost</span><span id="estimated-cost">Unavailable</span></div>
     <div class="status-row"><span>Expires</span><span id="expires">—</span></div>
+    <div id="local-cleanup-warning" class="cleanup-warning hidden" role="alert"></div>
     <div id="qr-row" class="status-row config-row hidden">
       <span class="status-row-label">Client configurations</span>
       <div class="client-config-shell">

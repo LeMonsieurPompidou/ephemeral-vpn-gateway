@@ -7,4 +7,6 @@ provider "scaleway" {
   project_id = var.scaleway_project_id
   access_key = var.scaleway_access_key
   secret_key = var.scaleway_secret_key
+  zone       = var.region
+  region     = join("-", slice(split("-", var.region), 0, 2))
 }
