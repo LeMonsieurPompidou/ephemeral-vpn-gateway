@@ -1,76 +1,70 @@
-# Local .terraform directories
+# Python environments, bytecode, test output, and tool caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.pytest-run*/
+.pytest-*/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Terraform local data, state, plans, and sensitive variable files
 .terraform/
-
-# Explicit local var files (sensitive)
-terraform.tfvars
-terraform.tfvars.json
-
-# .tfstate files
+.terraform-validation/
 *.tfstate
 *.tfstate.*
-
-# Crash log files
+.terraform.tfstate.lock.info
+tfplan
+*.tfplan
 crash.log
 crash.*.log
-
-# Exclude all .tfvars files, which are likely to contain sensitive data, such as
-# password, private keys, and other secrets. These should not be part of version 
-# control as they are data points which are potentially sensitive and subject 
-# to change depending on the environment.
+.terraformrc
+terraform.rc
+terraform.tfvars
+terraform.tfvars.json
 *.tfvars
 *.tfvars.json
 *.auto.tfvars
 *.auto.tfvars.json
-
-# Ignore override files as they are usually used to override resources locally and so
-# are not checked in
 override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
 
-# Ignore transient lock info files created by terraform apply
-.terraform.tfstate.lock.info
+# Keep non-sensitive source examples visible to Git.
+!terraform.tfvars.example
+!terraform.tfvars.json.example
 
-# Include override files you do wish to add to version control using negated pattern
-# !example_override.tf
+# Hérès deployment runtimes and generated credentials
+runtime/
+EphemeralVpnGateway/
+deployments.json
+deployment.log
+known_hosts
+*.conf
+*.key
+*.privatekey
+*.publickey
+*.log
 
-# Include tfplan files to ignore the plan output of command: terraform plan -out=tfplan
-# example: *tfplan*
-tfplan
-*.tfplan
-
-# Ignore CLI configuration files
-.terraformrc
-terraform.rc
-.terraform/
-
-# PyInstaller compilation artifacts
+# PyInstaller compilation artifacts (the reviewed release spec is source)
 build/
 dist/
 *.spec
 !Hérès_VPN.spec
 
-# Python bytecode caches
-__pycache__/
-*.pyc
-
-# Runtime and generated VPN secrets
-runtime/
-*.conf
-*.key
-*.privatekey
-*.log
-.pytest_cache/
-.pytest-tmp*/
-.pytest-*/
+# Local reproduction and editor/OS artifacts
 .backend-repro/
-.terraform-validation/
-.mypy_cache/
-.ruff_cache/
-.venv/
-venv/
-
-# Explicit plan/state variants
-*.tfplan
-*.tfstate.backup
+.vs/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

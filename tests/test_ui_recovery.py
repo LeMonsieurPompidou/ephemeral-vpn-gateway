@@ -166,6 +166,13 @@ def test_provider_credential_feedback_is_compact_provider_bound_and_secret_safe(
     assert "SCW_SECRET_KEY" not in index
 
 
+def test_packaged_startup_waits_for_the_complete_pywebview_bridge() -> None:
+    script = (ROOT / "vpn-gui-app" / "ui" / "script.js").read_text(encoding="utf-8")
+    assert "typeof bridge?.list_providers!=='function'" in script
+    assert "window.addEventListener('pywebviewready',initialize)" in script
+    assert "initializationStarted" in script
+
+
 def test_destroyed_record_can_show_separate_local_export_cleanup_warning() -> None:
     index = (ROOT / "vpn-gui-app" / "ui" / "index.html").read_text(encoding="utf-8")
     script = (ROOT / "vpn-gui-app" / "ui" / "script.js").read_text(encoding="utf-8")

@@ -1,23 +1,27 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import sys
+from pathlib import Path
+
+
+project_root = Path(SPECPATH).resolve()
+sys.path.insert(0, str(project_root))
+
+from release_bundle import audit_release_inputs, audited_datas
+
+
+audit_release_inputs(project_root)
 
 a = Analysis(
-    ['vpn-gui-app\\app.py'],
-    pathex=[],
+    [str(project_root / 'vpn-gui-app' / 'app.py')],
+    pathex=[str(project_root / 'vpn-gui-app')],
     binaries=[],
-    datas=[
-        ('vpn-gui-app\\ui', 'vpn-gui-app/ui'),
-        ('vpn-gui-app\\provider_catalog.json', 'vpn-gui-app'),
-        ('vpn-scaleway', 'vpn-scaleway'),
-        ('vpn-digitalocean', 'vpn-digitalocean'),
-        ('vpn-aws-lightsail', 'vpn-aws-lightsail'),
-        ('terraform-common', 'terraform-common'),
-    ],
+    datas=audited_datas(project_root),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['pytest', '_pytest', 'ruff', 'mypy', 'coverage', 'hypothesis', 'tests'],
     noarchive=False,
     optimize=0,
 )
@@ -42,5 +46,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['vpn-gui-app\\ui\\assets\\Hérès_VPN_logo.ico'],
+    icon=[str(project_root / 'vpn-gui-app' / 'ui' / 'assets' / 'Hérès_VPN_logo.ico')],
 )

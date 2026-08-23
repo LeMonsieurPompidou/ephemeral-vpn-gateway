@@ -2,7 +2,7 @@ const STATES = ['validating_credentials','initializing','planning','provisioning
 const $ = (id) => document.getElementById(id);
 let providers = [], locations = [], legacyStates = [], deploymentId = null, operationId = null;
 let activeDeploymentId = null, currentRecord = null, selectedRecoveryId = null, timer = null;
-let syncInFlight = false, uiBusy = false, configExportProposal = null;
+let syncInFlight = false, uiBusy = false, configExportProposal = null, initializationStarted = false;
 let clientMetadata = [], selectedClientId = null, recoveryItems = [];
 const api = () => window.pywebview?.api;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -236,9 +236,17 @@ async function validateCredentials(){
   const providerId=$('provider').value;clearCredentialFeedback();$('validate-credentials').disabled=true;
   try{renderCredentialFeedback(await api().validate_credentials(providerId),providerId);}finally{$('validate-credentials').disabled=uiBusy;}
 }
-async function initialize(){ if(!api()){setTimeout(initialize,100);return;} providers=await api().list_providers(); $('provider').replaceChildren(); providers.forEach((p)=>option($('provider'),p.id,p.display_name)); refreshLocations(); renderSteps('idle'); startTimer(); await loadLegacyStates(); await loadRecovery(); setInterval(()=>{if(!document.hidden)reconcileCurrentDeployment().catch(()=>{});},1000); setInterval(()=>{if(!document.hidden)loadRecovery().catch(()=>{});},5000); }
+async function initialize(){
+  const bridge=api();
+  if(typeof bridge?.list_providers!=='function'){setTimeout(initialize,100);return;}
+  if(initializationStarted)return;
+  initializationStarted=true;
+  try{
+    providers=await bridge.list_providers(); $('provider').replaceChildren(); providers.forEach((p)=>option($('provider'),p.id,p.display_name)); refreshLocations(); renderSteps('idle'); startTimer(); await loadLegacyStates(); await loadRecovery(); setInterval(()=>{if(!document.hidden)reconcileCurrentDeployment().catch(()=>{});},1000); setInterval(()=>{if(!document.hidden)loadRecovery().catch(()=>{});},5000);
+  }catch(error){initializationStarted=false;$('status-text').textContent='Application initialization failed';throw error;}
+}
   $('provider').addEventListener('change',()=>{clearCredentialFeedback();refreshLocations();renderLegacyStates();setBusy(false);}); $('country').addEventListener('change',refreshRegions); $('location').addEventListener('change',refreshBadges);
 $('deploy').addEventListener('click',()=>deploy().catch((e)=>{alert(e.message);setBusy(Boolean(operationId||activeDeploymentId));})); $('validate-credentials').addEventListener('click',()=>validateCredentials().catch((e)=>alert(e.message))); $('destroy').addEventListener('click',destroy); $('remove-local').addEventListener('click',removeLocal); $('cancel').addEventListener('click',async()=>{if(deploymentId)await api().cancel(deploymentId);});
 $('copy-ip').addEventListener('click',()=>navigator.clipboard.writeText($('ip-address').textContent)); $('save-config').addEventListener('click',()=>saveConfig());
 $('open-recovery').addEventListener('click',()=>{$('legacy-tools').open=true;$('recovery').scrollIntoView({behavior:'smooth',block:'start'});});
-window.addEventListener('beforeunload',(event)=>{if(currentRecord?.resources_possible&&currentRecord.state!=='destroyed'){event.preventDefault();event.returnValue='Active cloud resources may still exist.';}}); document.addEventListener('DOMContentLoaded',initialize);
+window.addEventListener('beforeunload',(event)=>{if(currentRecord?.resources_possible&&currentRecord.state!=='destroyed'){event.preventDefault();event.returnValue='Active cloud resources may still exist.';}}); window.addEventListener('pywebviewready',initialize); document.addEventListener('DOMContentLoaded',initialize);

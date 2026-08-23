@@ -1,222 +1,378 @@
-# Ephemeral VPN Gateway
+# Hérès VPN
 
-Ephemeral VPN Gateway provisions short-lived WireGuard gateways through Terraform and a Python/pywebview desktop UI. Terraform adapters are included for DigitalOcean, Scaleway, and AWS Lightsail. Cloud IP addresses are datacenter addresses; selecting a country does not guarantee access to a particular streaming service.
+<p align="center">
+  <img src="vpn-gui-app/ui/assets/Hérès_VPN_logo.png" alt="Hérès VPN logo" width="160">
+</p>
 
-## Normal workflow
+Hérès VPN is a Windows desktop application that provisions temporary WireGuard VPN gateways in cloud accounts controlled by the user.
 
-The primary UI is deliberately small:
+Choose a provider, location, lifetime, and number of devices; Hérès creates the gateway, presents a separate QR code and WireGuard configuration for each device, tracks the running time and estimated cost, and destroys the infrastructure from the same application. End-to-end deployment and VPN connectivity have been manually validated on AWS Lightsail, DigitalOcean, and Scaleway.
 
-```text
-Provider -> Country -> Location -> Lifetime -> VPN clients -> Deploy -> Connect
-```
+## Features
 
-The normal GUI intentionally uses the validated defaults: IPv4 full tunnel (`AllowedIPs = 0.0.0.0/0`), DNS `1.1.1.1` and `1.0.0.1`, WireGuard UDP port 51820, MTU 1420, persistent keepalive 25, and automatic SSH source-address detection. These remain backend options for tests and future expert workflows, but infrastructure controls are not shown in the normal product flow.
+- **Multi-cloud gateways:** deploy to AWS Lightsail, DigitalOcean, or Scaleway, with country and region selection from a shared provider catalog.
+- **Ephemeral lifecycle:** follow credential validation, Terraform initialization, planning, provisioning, cloud initialization, readiness, and explicit destruction from one desktop workflow.
+- **Best-effort lifetime:** optionally schedule local cleanup after 30 minutes to 8 hours. Cleanup cannot run while Hérès is closed, the computer is off, or credentials are unavailable; this is not a provider-side TTL guarantee.
+- **Multi-client WireGuard:** create 1–10 independent peers with unique keypairs and tunnel addresses. One client should be used per device.
+- **Mobile and desktop delivery:** scan a client-specific QR code or export `HeresVPN1.conf` through `HeresVPN10.conf` with a native Windows Save As dialog.
+- **Estimated cost visibility:** display the catalog's hourly estimate, live session duration, and real-time **Estimated cost** where a trusted numeric rate is available.
+- **Recovery-first safety:** deployment-scoped Terraform state, durable lifecycle records, interrupted-operation recovery, provider-scoped legacy-state reconciliation, and conservative destroy rules.
+- **Secret-aware cleanup:** after confirmed cloud destruction, remove runtime secrets and provenance-matching configuration files exported by Hérès.
 
-Select one VPN client for every phone, computer, or other device (1 to 10). Every client receives a unique WireGuard keypair and tunnel address, with its own QR code and Desktop-exportable `.conf`. **Do not reuse the same WireGuard client configuration on multiple devices. Create/select one client per device.**
-
-`Lifetime` is local, best-effort cleanup. It is persisted and retried after the application restarts, but it cannot destroy resources while the computer is off, the application is not running, or provider credentials are unavailable. There is currently no provider-side TTL service.
-
-## Architecture and runtime state
-
-```text
-UI -> BridgeService -> Orchestrator -> ProviderRegistry -> TerraformRunner
-```
-
-Every operation is bound to one deployment UUID. The default Windows runtime root is `%LOCALAPPDATA%\EphemeralVpnGateway`; set `EPHEMERAL_VPN_RUNTIME_DIR` to override it.
+## How it works
 
 ```text
-EphemeralVpnGateway\
-|-- deployments.json
-|-- deployments.lock
-|-- locks\<provider>.lock
-`-- <deployment-id>\
-    |-- .terraform\
-    |-- terraform-work\                 (state-free configuration copy)
-    |-- terraform-work-manifest.json
-    |-- terraform.tfstate
-    |-- terraform.tfstate.backup       (when Terraform creates one)
-    |-- deployment.tfplan
-    |-- deployment.auto.tfvars.json
-    |-- clients\
-    |   |-- client-1\
-    |   |   |-- client.privatekey
-    |   |   `-- client.conf            (after apply)
-    |   `-- client-N\ ...
-    |-- ssh.privatekey
-    |-- ssh.publickey
-    |-- known_hosts
-    `-- deployment.log
+User
+  |
+  v
+Hérès desktop GUI (pywebview)
+  |
+  v
+Python bridge and lifecycle orchestrator
+  |
+  v
+Deployment-scoped Terraform working directory and state
+  |
+  +----------+----------------+----------------+
+  |          |                |                |
+  v          v                v                v
+AWS       DigitalOcean     Scaleway       Recovery registry
+  \          |                /
+   \         |               /
+    +--------+--------------+
+             |
+             v
+      WireGuard gateway
+             |
+      +------+------+ ...
+      |             |
+      v             v
+   Client 1      Client 2
 ```
 
-Each Terraform root declares the local backend. A fresh deployment copies only Terraform configuration, the provider lockfile, optional legacy tfvars, and shared templates into its runtime working directory; provider-root state is never copied. Deployment `init` runs there with `-input=false -reconfigure`, configures the backend with the absolute runtime `terraform.tfstate` path, and sets a deployment-specific `TF_DATA_DIR`. Recovery initialization first verifies the persisted local-backend metadata and uses the same path without `-reconfigure`. Plan, saved-plan apply, output, and destroy therefore use one verified backend. Runtime guards reject unsafe paths, verify the staged configuration manifest and backend metadata, and fingerprint provider-root state before and after every Terraform operation.
+The normal deployment flow is:
 
-Provider operations also use an OS/filesystem lock. Registry replacement is atomic and registry reads/writes use a cross-process lock.
+1. Select a provider.
+2. Select a country and location.
+3. Choose a lifetime or leave automatic expiration disabled.
+4. Choose one VPN client for each device.
+5. Run **Check credentials**.
+6. Click **Deploy VPN** and wait for **Ready**.
+7. Connect each device with its own QR code or `.conf` file.
+8. Click **Destroy cloud resources** when finished.
 
-## Legacy provider-root state recovery
+## Multi-client WireGuard
 
-Older versions could write ignored `terraform.tfstate` files into `vpn-aws-lightsail`, `vpn-digitalocean`, or `vpn-scaleway`. Startup inspects primary and backup files without changing them and classifies them as empty, active, malformed, ambiguous, or migrated.
+Hérès uses the `10.8.0.0/24` tunnel network:
 
-The Gateway form never shows the large technical legacy-state card. Empty, validly migrated, and validly reconciled-stale states are invisible. A genuinely blocking state produces only a compact **Deployment recovery is required** warning; the hashes, lineage, serial, migration, and stale-reconciliation controls are available only after opening **Recovery**.
+```text
+Gateway     10.8.0.1
+Client 1    10.8.0.2
+Client 2    10.8.0.3
+...
+Client 10   10.8.0.11
+```
 
-- Active, malformed, and ambiguous state blocks a new deployment for that provider.
-- The original state is never deleted, overwritten, moved, merged, or destroyed automatically.
-- Automatic migration is offered only when the primary state's provider resources and server public key match exactly one existing deployment registry record.
-- Migration creates a timestamped runtime backup, copies the state into that matched deployment's runtime, verifies hashes, and records the source and backup in registry metadata.
-- If no runtime deployment matches, **Mark stale — cloud absence confirmed** is available for a parseable active state. It requires the operator to type an explicit confirmation after independently verifying that every summarized cloud resource is absent. The action does not contact the provider or run Terraform.
-- An empty primary with a resource-bearing backup remains ambiguous. For DigitalOcean and Scaleway, **Verify cloud state** performs only exact, read-only provider GET requests for the resource identities in that backup. A short-lived verification receipt is bound to both state-file fingerprints. **Mark stale and reconcile** appears only when every supported cloud object is confirmed absent; any existing object, unavailable credential/API, unsupported identity, changed state byte, or expired verification keeps that provider blocked.
-- Stale reconciliation copies the primary state and any backup to `%LOCALAPPDATA%\EphemeralVpnGateway\legacy-quarantine\<provider>\<timestamp>-<short-sha>\`, verifies the copies, and atomically stores a receipt under `legacy-reconciliations`. The provider is unblocked only while the source path, SHA-256, lineage, serial, resource/output summaries, and quarantine copies still match that receipt.
-- A migrated classification is valid only while the recorded deployment runtime still contains a parseable, provider-matching state with the same SHA-256 as the legacy source.
-- Blocking is provider-scoped: an unresolved DigitalOcean state cannot unblock DigitalOcean, but it does not prevent a new AWS or Scaleway deployment. Source runs and packaged runs share the canonical legacy source mapping, verification receipts, reconciliation receipts, and quarantine roots under the same LocalAppData application root.
+Every client receives:
 
-## Credentials
+- an independent WireGuard private/public keypair;
+- a unique tunnel IPv4 address;
+- one `[Peer]` entry on the gateway with a `/32` route;
+- one full-tunnel client configuration; and
+- one QR configuration and one exportable `.conf`.
 
-### AWS IAM Identity Center / SSO
+Client private keys remain local and do not enter Terraform variables, Terraform state, cloud user-data, provider APIs, the deployment registry, or logs. Terraform and the gateway receive only each client's public key and tunnel address. The server WireGuard key is generated locally but must be delivered to the gateway, so the deployment plan, state, and generated provisioning data are sensitive.
 
-Configure and log in with AWS CLI v2, then launch the GUI from the same environment:
+Do not reuse one Hérès client configuration on multiple devices. WireGuard endpoint roaming can make devices using the same peer identity displace one another.
+
+## Requirements
+
+Hérès has been validated end-to-end on Windows. The code contains POSIX permission handling, but macOS and Linux desktop workflows and packaging have not been validated as releases.
+
+Required to run from source:
+
+- Windows with Python 3.10 or newer;
+- Terraform 1.5 or newer;
+- OpenSSH client available as `ssh`;
+- a supported cloud account and credentials;
+- a WireGuard client on each device that will connect; and
+- AWS CLI v2 when using AWS Lightsail with IAM Identity Center/SSO.
+
+Runtime Python dependencies are declared in [`vpn-gui-app/requirements.txt`](vpn-gui-app/requirements.txt). Development tools are declared in [`requirements-dev.txt`](requirements-dev.txt). Node.js is only needed for the JavaScript syntax checks used during development.
+
+## Run from source
+
+From Windows PowerShell:
+
+```powershell
+git clone https://github.com/LeMonsieurPompidou/terraform-ephemeral-vpn.git
+cd terraform-ephemeral-vpn
+
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r .\vpn-gui-app\requirements.txt -r .\requirements-dev.txt
+
+.\.venv\Scripts\python.exe .\vpn-gui-app\app.py
+```
+
+Hérès stores deployment runtimes under `%LOCALAPPDATA%\EphemeralVpnGateway` by default. `EPHEMERAL_VPN_RUNTIME_DIR` can override that location for development, but changing it also changes which durable registry and recovery records the process sees.
+
+## Provider credentials
+
+Use placeholders in local configuration and never commit real credentials. **Check credentials** follows the same credential source that the provider will use during deployment.
+
+### AWS Lightsail
+
+Hérès expects an AWS CLI v2 profile through `AWS_PROFILE`. A generic IAM Identity Center setup is:
 
 ```powershell
 aws configure sso --profile heres-vpn
 aws sso login --profile heres-vpn
 $env:AWS_PROFILE = "heres-vpn"
-.\.venv\Scripts\python.exe vpn-gui-app\app.py
+
+.\.venv\Scripts\python.exe .\vpn-gui-app\app.py
 ```
 
-Before planning, the application locates AWS CLI v2 and runs a bounded, non-interactive:
-
-```text
-aws sts get-caller-identity --profile heres-vpn --no-cli-pager
-```
-
-Account details are not logged. An expired session produces an instruction to rerun `aws sso login --profile heres-vpn`. The UI's **Check credentials** action can be retried without restarting.
+The credential check runs a bounded, non-interactive `aws sts get-caller-identity` for the selected profile. Identity output and account details are not logged. If the SSO session expires, log in again and retry **Check credentials**.
 
 ### DigitalOcean
 
-The existing `main`-branch credential contract remains supported: an ignored
-`vpn-digitalocean/terraform.tfvars` may supply `do_token` (and the historical
-`ssh_key_name`). The deployment-scoped working copy receives a protected byte-for-byte
-copy, while the provider-root file remains unchanged.
+The known-good, Git-ignored provider tfvars contract remains supported. Create `vpn-digitalocean/terraform.tfvars`:
 
-Environment authentication is also supported. Use the canonical provider variable and
-launch Hérès from that PowerShell session:
-
-```powershell
-$env:DIGITALOCEAN_TOKEN = "<token>"
-.\.venv\Scripts\python.exe vpn-gui-app\app.py
+```hcl
+do_token     = "<digitalocean-token>"
+ssh_key_name = "<existing-key-name>"
 ```
 
-`DIGITALOCEAN_ACCESS_TOKEN` is accepted as the Terraform provider's supported fallback,
-but Hérès consistently recommends `DIGITALOCEAN_TOKEN`. With environment credentials,
-**Check credentials** performs a bounded, read-only account request and distinguishes
-missing credentials, rejected/insufficient credentials, and network/API failure without
-logging the token. With `terraform.tfvars`, it confirms that the known-good variable is
-configured and reports that Terraform will perform the provider validation.
+`do_token` is the credential input. `ssh_key_name` is retained for historical/manual compatibility; desktop deployments normally register their generated per-deployment SSH public key.
+
+Environment authentication is also supported:
+
+```powershell
+$env:DIGITALOCEAN_TOKEN = "<digitalocean-token>"
+.\.venv\Scripts\python.exe .\vpn-gui-app\app.py
+```
+
+`DIGITALOCEAN_ACCESS_TOKEN` is accepted as the provider-compatible fallback, while `DIGITALOCEAN_TOKEN` is the recommended variable. Environment-based credential checking performs a bounded read-only account request. With tfvars, Hérès verifies only that the expected variable is configured and leaves value validation to Terraform without exposing it.
 
 ### Scaleway
 
-The existing `main`-branch contract remains supported: an ignored
-`vpn-scaleway/terraform.tfvars` may supply `scaleway_access_key`,
-`scaleway_secret_key`, and `scaleway_project_id`. Alternatively, set the provider
-environment variables and launch Hérès from the same PowerShell session:
+The known-good, Git-ignored tfvars contract is:
+
+```hcl
+scaleway_access_key = "<access-key>"
+scaleway_secret_key = "<secret-key>"
+scaleway_project_id = "<project-id>"
+```
+
+Place these values in `vpn-scaleway/terraform.tfvars`, or use environment variables:
 
 ```powershell
 $env:SCW_ACCESS_KEY = "<access-key>"
 $env:SCW_SECRET_KEY = "<secret-key>"
 $env:SCW_DEFAULT_PROJECT_ID = "<project-id>"
-.\.venv\Scripts\python.exe vpn-gui-app\app.py
+
+.\.venv\Scripts\python.exe .\vpn-gui-app\app.py
 ```
 
-The selected catalog location supplies the Scaleway zone and region explicitly, so `SCW_DEFAULT_ZONE` and `SCW_DEFAULT_REGION` are not required. **Check credentials** makes a bounded, read-only request for the configured Project. Missing-variable guidance names variables only; it never displays existing values.
+The selected catalog location supplies the Scaleway zone and region, so `SCW_DEFAULT_ZONE` and `SCW_DEFAULT_REGION` are not required. Environment-based checking performs a bounded, read-only project request; tfvars values are validated by Terraform.
 
-### Environment lifetime and packaged builds
+### Credential handling notes
 
-PowerShell `$env:...` assignments exist only in that process and its child processes. A source run or packaged executable started from the same terminal inherits them; an executable opened later by double-click from Explorer does not inherit an unrelated terminal's temporary environment. Either start the packaged executable from the configured terminal or deliberately configure Windows user environment variables outside Hérès, understanding that Windows then persists them for other processes owned by that user.
+- Provider `terraform.tfvars` files are ignored by Git and are copied into the protected deployment runtime only when Terraform needs them.
+- Hérès does not intentionally store provider credentials in `deployments.json`, application logs, Live non-sensitive logs, or browser storage.
+- PowerShell `$env:...` assignments are session-local and inherited only by child processes. Launch Hérès from the same terminal.
+- An `.exe` opened independently from Explorer will not inherit temporary variables from an unrelated PowerShell session.
+- Do not commit credentials, paste them into issues, or include them in screenshots.
 
-Hérès never writes provider credentials to the registry or logs. Environment credentials
-remain in the inherited process environment. A user-created provider `terraform.tfvars`
-is git-ignored, copied only into the protected deployment runtime for Terraform, and
-removed with other sensitive runtime artifacts after confirmed destroy. Never commit a
-populated tfvars file.
+## Usage
 
+The Gateway form contains the normal product controls:
 
-## SSH readiness and source address
-
-Immediately before planning, the application requests its public IPv4 from `https://checkip.amazonaws.com/`, validates that it is globally routable, and uses the exact `/32` in the provider firewall. Detection has a short timeout, never falls back to `0.0.0.0/0`, and does not log the address. A manual override remains available through the backend options for diagnostics, not the normal GUI.
-
-If SSH readiness fails and automatic redetection returns a different address, the application performs one controlled Terraform plan/apply to update the SSH rule, then retries. It does not loop indefinitely.
-
-Each deployment also receives a locally generated Ed25519 SSH key:
-
-- AWS imports its public key as a Lightsail key pair and connects as `ubuntu`.
-- DigitalOcean registers its public key as a deployment SSH-key resource and connects as `root`.
-- Scaleway registers its public key as a deployment account SSH-key resource and connects as `root`.
-
-The SSH command always specifies the runtime private key with `-i`, uses `IdentitiesOnly=yes`, disables password/keyboard-interactive authentication, and keeps a deployment-local `known_hosts`. The private key is never passed to Terraform.
-
-Readiness checks wait for cloud-init and verify the marker, `wg-quick@wg0`, the `wg0` link, forwarding, NAT, and the configured UDP listener. Cancellation interrupts Terraform and SSH retry waits.
-
-## Lifecycle, cancellation, and recovery
-
-Durable registry metadata records plan/apply timestamps, state presence, whether cloud resources may exist, cleanup status, expiry, non-secret client identities/addresses, the catalog hourly-price snapshot, and legacy migration provenance. Client private keys are never stored in the registry.
-
-- Before apply starts, cancellation means cloud resources cannot have been created. The UI offers **Remove local deployment**, which removes the runtime and registry record.
-- From immediately before apply onward, the application conservatively assumes resources may exist. State and recovery material are retained and the UI offers **Destroy cloud resources**.
-- Destroy always receives a new cancellation token; it never reuses a cancelled deployment token.
-- Operations are mapped directly to their deployment IDs, so polling, cancellation, logs, and cleanup cannot select the newest unrelated record.
-- On restart, interrupted pre-apply records become locally removable. Interrupted apply/readiness/destroy records are marked as requiring reconciliation.
-
-Do not delete state for a partial apply. If state is missing after apply may have started, use the provider console and recovery metadata to reconcile resources before removing local records.
-
-## Keys, logs, and sensitive cleanup
-
-WireGuard server and client keypairs are generated locally with Python `cryptography` X25519. Users do not run `wg genkey`. Terraform receives the server private/public keys and a typed list containing each client's public key and `/32` tunnel address. It never receives a client private key. The server configuration contains one peer block per client.
-
-At Ready, select a client to display only that client's QR code and Desktop export. Export names are deliberately simple WireGuard tunnel names: `HeresVPN1.conf` through `HeresVPN10.conf`, independent of provider, location, or deployment. Windows resolves the real Desktop known folder, including redirected/OneDrive Desktops, before opening native Save As. The protected runtime copy remains authoritative.
-
-The status card estimates session cost from the catalog's numeric hourly estimate and elapsed time since `apply_started_at`. The timer freezes at confirmed `destroyed_at`; requesting destroy does not stop it. This is an estimate only: provider rounding, minimum charges, taxes, and other resources can make actual billing differ. Locations without verified pricing display **Unavailable**. No billing API is queried.
-
-Saved plans, tfvars, and state are sensitive because they contain server provisioning material. Runtime files use restrictive modes where supported and inherit the user's protected application-data ACL on Windows.
-
-Per-deployment logs are redacted, ANSI-stripped, capped at 512 KiB, and never intentionally contain private keys, generated client configuration, API tokens, or temporary AWS credentials.
-
-After Terraform confirms successful destruction, the application removes:
-
-- generated tfvars and plans
-- Terraform state and backups
-- `.terraform`
-- WireGuard client secrets/configuration (unless explicitly preserved through the compatibility API)
-- the temporary SSH keypair and deployment `known_hosts`
-- every exact user export tracked for that deployment whose regular-file type and SHA-256 still match its authoritative client configuration
-
-The app never globs Desktop configuration files. A missing tracked export is considered already clean; a symlink, changed file, malformed provenance record, or mismatched hash is refused and shown as a separate manual local-cleanup warning without changing the successful cloud-destroy state. Failed destruction leaves exports and all recovery-required material untouched. Only sanitized tombstone/provenance metadata and the bounded redacted log remain.
-
-The provider selector contains only implemented Terraform providers: AWS Lightsail, DigitalOcean, and Scaleway. A user-owned residential exit remains a possible roadmap direction but is not offered as a deployable provider.
-
-## Development and validation
-
-Requirements are Python 3.10+, Terraform 1.5+, OpenSSH, AWS CLI v2 for Lightsail, and a WireGuard client.
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r vpn-gui-app\requirements.txt -r requirements-dev.txt
-.\.venv\Scripts\python.exe vpn-gui-app\app.py
+```text
+Provider -> Country -> City / region -> Lifetime -> VPN clients
 ```
 
-Build from the repository root:
+During deployment, the UI reconciles its progress with the durable backend lifecycle:
 
-```powershell
-.\.venv\Scripts\pyinstaller "Hérès_VPN.spec"
+```text
+Validating credentials
+  -> Initializing
+  -> Planning
+  -> Provisioning
+  -> Waiting for cloud init
+  -> Checking WireGuard
+  -> Ready
 ```
 
-Local tests mock Terraform and cloud interactions; they never apply infrastructure:
+At **Ready**:
+
+- select a client tab;
+- scan its QR code for a mobile WireGuard app; or
+- click **Save configuration**, accept the Desktop default, and import the corresponding `HeresVPN1.conf`–`HeresVPN10.conf` file into WireGuard for Windows.
+
+Each selected client has different key material and a different tunnel address. QR/configuration contents are never written to logs.
+
+When finished, use **Destroy cloud resources**. After Terraform confirms destruction, Hérès removes sensitive runtime material and attempts to delete every tracked exported `.conf` whose path, regular-file type, and content fingerprint still match the file Hérès created.
+
+## Recovery
+
+Recovery appears when a deployment was interrupted, an apply or destroy failed, resources may still exist, or historical provider-root Terraform state requires attention.
+
+Hérès prefers to block rather than silently forget infrastructure that might still exist:
+
+- **Destroy cloud resources** is the correct action once apply may have started or runtime state contains managed resources.
+- **Remove local deployment** is available only when the lifecycle and state prove that cloud resources were not created and are no longer possible.
+- Legacy state is scoped to its provider, so a DigitalOcean blocker does not prevent an unrelated AWS or Scaleway deployment.
+- Ambiguous DigitalOcean or Scaleway legacy state can be checked with exact read-only resource queries. **Mark stale and reconcile** is enabled only after cloud absence is verified for the exact state fingerprint.
+- Reconciliation preserves the original state, creates verified quarantine copies, and binds a durable receipt to the provider, source path, lineage, serial, resource summary, and SHA-256 fingerprints.
+
+Do not manually delete or edit `terraform.tfstate`, discard a recovery record simply because it is old, or use local removal when cloud resources may exist.
+
+## Security model
+
+### Local keys and configurations
+
+- WireGuard and deployment SSH keypairs are generated locally.
+- Each client private key stays in its protected deployment runtime and is omitted from Terraform/cloud inputs, registry metadata, and logs.
+- Private runtime files use verified Windows ACLs restricted to the current user; POSIX systems use mode `0600`.
+- The SSH client uses the deployment identity explicitly, a deployment-local `known_hosts`, batch authentication, and no password fallback.
+- QR codes and exported configurations contain a WireGuard client private key and must be treated as credentials.
+
+### Provider credentials and logs
+
+- Provider credentials remain in their original ignored tfvars file or the launching process environment.
+- Required tfvars are staged into the protected runtime and removed after confirmed destruction.
+- Logs are secret-redacted, ANSI-stripped, UTF-8 decoded, bounded in size, and designed for non-sensitive lifecycle diagnostics.
+
+### Terraform and recovery isolation
+
+- Every deployment has its own Terraform working copy, `TF_DATA_DIR`, backend metadata, saved plan, and local state path.
+- Fresh initialization uses a non-interactive explicit backend configuration and does not migrate provider-root historical state.
+- Recovery destroy verifies that backend metadata and state still belong to the same deployment before Terraform runs.
+- Provider-root state is fingerprinted around Terraform operations; legacy reconciliation uses provider-scoped locks, immutable quarantine copies, and fingerprint-bound receipts.
+- A single durable active-operation rule prevents two deployments from being created concurrently.
+
+### Exported configurations
+
+Hérès records the exact path and SHA-256 of every successful export. After confirmed destroy it deletes only matching regular files, never globs a Desktop and never follows symlinks. Changed, replaced, or unsafe paths are left untouched with a local cleanup warning.
+
+If a configuration is copied, renamed, uploaded, or shared outside a tracked export path, Hérès cannot find or clean that copy.
+
+## Estimated cost
+
+The provider catalog currently contains these estimates:
+
+| Provider | Catalog estimate |
+|---|---:|
+| AWS Lightsail | approximately `$0.005/hour` |
+| DigitalOcean | approximately `$0.009/hour` |
+| Scaleway | `Unavailable` |
+
+The live calculation is:
+
+```text
+Estimated cost = elapsed seconds / 3600 * catalog hourly estimate
+```
+
+Elapsed time starts at `apply_started_at`, not when the application opens. It continues while resources may exist, including during destroy, and freezes at confirmed `destroyed_at` (with the destroyed record's update time as a backward-compatible fallback).
+
+This is an estimate only. Hérès does not query provider billing APIs. Provider rounding, minimum charges, taxes, data transfer, and other billable resources can make the actual invoice differ.
+
+## Limitations
+
+- **Datacenter IPs:** all current providers supply cloud/datacenter addresses. Websites and streaming services may recognize or block them. A public IP in a selected country does not guarantee a particular content catalog.
+- **Local expiration:** lifetime cleanup is best-effort and cannot run while the app or computer is unavailable.
+- **Windows validation:** the complete desktop workflow has been validated on Windows; other desktop platforms are not currently release-validated.
+- **No billing integration:** cost is calculated from static catalog metadata rather than provider invoices.
+- **No stable downloadable release claimed:** source execution is the current reproducible path. Windows packaging is prepared with PyInstaller, but each release build still requires end-to-end validation.
+
+## Project structure
+
+```text
+ephemeral-vpn-gateway/
+|-- vpn-gui-app/          Python orchestration, provider adapters, security, and UI
+|-- vpn-aws-lightsail/    AWS Lightsail Terraform adapter
+|-- vpn-digitalocean/     DigitalOcean Terraform adapter
+|-- vpn-scaleway/         Scaleway Terraform adapter
+|-- terraform-common/     Shared WireGuard/bootstrap templates
+|-- tests/                Lifecycle, security, provider, recovery, and UI regressions
+|-- .github/workflows/    GitHub Actions validation
+`-- Hérès_VPN.spec        PyInstaller build specification
+```
+
+## Technical highlights
+
+- Python typed models and provider adapters behind a pywebview desktop bridge.
+- Terraform lifecycle orchestration with deployment-scoped backends and state.
+- Shared provider-safe bootstrap generation for Bash and cloud-config transports.
+- Multi-peer WireGuard key, address, server configuration, QR, and export management.
+- Progress-aware cloud-init and SSH readiness monitoring with typed transient/fatal failures.
+- Windows private-file ACL hardening and POSIX permission checks.
+- Atomic registry writes, cross-process locks, single-active-operation semantics, and deterministic recovery.
+- Secret-redacted bounded logs and provenance-checked post-destroy cleanup.
+
+## Testing and quality
+
+The regression suite covers backend initialization, bootstrap rendering, provider credentials, multi-client WireGuard, SSH/readiness behavior, lifecycle recovery, legacy reconciliation, configuration export/cleanup, cost estimation, and GUI state synchronization.
+
+Run the main checks from PowerShell:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider --basetemp .pytest-run-last
 .\.venv\Scripts\python.exe -m ruff check .
 .\.venv\Scripts\python.exe -m ruff format --check .
 .\.venv\Scripts\python.exe -m mypy .
 terraform fmt -check -recursive
+Get-ChildItem .\vpn-gui-app\ui -Filter *.js | ForEach-Object { node --check $_.FullName }
+git diff --check
 ```
 
-For provider schema validation, use `terraform init -backend=false` followed by `terraform validate`. Never run plan/apply against an unreconciled provider-root state.
+Validate provider schemas without enabling a backend:
 
-Licensed under the MIT License. See [LICENSE](LICENSE).
+```powershell
+terraform -chdir=vpn-aws-lightsail init -backend=false -input=false -lockfile=readonly
+terraform -chdir=vpn-aws-lightsail validate
+
+terraform -chdir=vpn-digitalocean init -backend=false -input=false -lockfile=readonly
+terraform -chdir=vpn-digitalocean validate
+
+terraform -chdir=vpn-scaleway init -backend=false -input=false -lockfile=readonly
+terraform -chdir=vpn-scaleway validate
+```
+
+GitHub Actions runs Python formatting, linting, typing, tests, Terraform formatting, and backend-disabled validation. Automated tests mock cloud mutations and do not deploy infrastructure.
+
+## Building the Windows application
+
+The repository contains a PyInstaller specification that bundles the GUI, provider Terraform roots, shared bootstrap templates, and application icon:
+
+```powershell
+.\.venv\Scripts\python.exe -m PyInstaller .\Hérès_VPN.spec
+```
+
+The output is created under `dist/`. Packaging is prepared, but this repository does not claim that a current downloadable binary release has been published. Validate the built executable's credential inheritance, Desktop export, recovery paths, and complete deploy/destroy workflow before distributing it.
+
+The PyInstaller spec uses an audited file-by-file data allowlist. It deliberately includes the committed Terraform source and dependency lockfile for each provider, shared bootstrap templates, the provider catalog, GUI assets, and the locally vendored QR renderer. It rejects tfvars, Terraform state, plans, generated keys/configurations, tests, and `.terraform` directories before packaging. Run the manifest audit directly with:
+
+```powershell
+.\.venv\Scripts\python.exe .\release_bundle.py
+```
+
+Build from a clean working tree and inspect the resulting archive as normal release hygiene. DigitalOcean and Scaleway tfvars remain supported when running from source, but are never bundled; packaged users should launch Hérès with the documented provider environment variables.
+
+## Development
+
+Keep changes focused and run the relevant regression tests plus the validation commands above. Never commit:
+
+- provider credentials or populated tfvars;
+- Terraform state, plans, or `.terraform` directories;
+- generated WireGuard/SSH keys or client configurations;
+- runtime logs or deployment directories; or
+- locally built executables.
+
+The repository's `.gitignore` excludes these common artifacts, but review every diff before publishing.
+
+## License
+
+Hérès VPN is licensed under the [MIT License](LICENSE).
