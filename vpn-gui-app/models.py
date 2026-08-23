@@ -89,6 +89,20 @@ class DeploymentOptions:
     expiration_minutes: int | None = None
     automatic_expiration: bool = False
     instance_type: str | None = None
+    client_count: int = 1
+
+
+@dataclass(frozen=True)
+class ClientMetadata:
+    id: str
+    index: int
+    display_name: str
+    tunnel_ipv4: str
+    config_relative_path: str
+    private_key_relative_path: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -121,6 +135,9 @@ class DeploymentRecord:
     legacy_source_path: str | None = None
     legacy_source_sha256: str | None = None
     legacy_backup_path: str | None = None
+    client_schema_version: int = 0
+    clients: list[ClientMetadata] = field(default_factory=list)
+    estimated_hourly_cost_usd: float | None = None
     updated_at: str = field(default_factory=lambda: now_iso())
 
     def to_dict(self) -> dict[str, Any]:
@@ -133,6 +150,12 @@ class DeploymentRecord:
         copy = dict(value)
         copy.pop("deployment_created_at", None)
         copy["state"] = DeploymentState(copy["state"])
+        clients = copy.get("clients", [])
+        if not isinstance(clients, list):
+            raise ValueError("Deployment client metadata is malformed")
+        copy["clients"] = [ClientMetadata(**item) for item in clients if isinstance(item, dict)]
+        if len(copy["clients"]) != len(clients):
+            raise ValueError("Deployment client metadata is malformed")
         allowed = {field.name for field in __import__("dataclasses").fields(cls)}
         return cls(**{key: item for key, item in copy.items() if key in allowed})
 

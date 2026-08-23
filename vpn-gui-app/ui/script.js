@@ -1,8 +1,9 @@
 const STATES = ['validating_credentials','initializing','planning','provisioning','waiting_for_cloud_init','checking_wireguard','verifying_egress','ready'];
 const $ = (id) => document.getElementById(id);
 let providers = [], locations = [], legacyStates = [], deploymentId = null, operationId = null;
-let activeDeploymentId = null, currentRecord = null, selectedRecoveryId = null, startedAt = null, timer = null;
+let activeDeploymentId = null, currentRecord = null, selectedRecoveryId = null, timer = null;
 let syncInFlight = false, uiBusy = false, configExportProposal = null;
+let clientMetadata = [], selectedClientId = null;
 const api = () => window.pywebview?.api;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -10,7 +11,7 @@ function selectedProvider(){ return providers.find((p) => p.id === $('provider')
 function selectedLocation(){ return locations.find((l) => l.id === $('location').value); }
 function option(el, value, label){ const node=document.createElement('option'); node.value=value; node.textContent=label; el.append(node); }
 function updateActionButtons(){const state=currentRecord?.state||'idle';const cloudPossible=Boolean(currentRecord?.resources_possible||currentRecord?.apply_started_at);const terminal=['failed','cancelled','ready'].includes(state);$('destroy').disabled=uiBusy||!deploymentId||!cloudPossible||state==='destroyed'||state==='destroying';$('remove-local').disabled=uiBusy||!deploymentId||cloudPossible||!terminal;}
-function setBusy(busy){ uiBusy=busy; $('deploy').disabled=busy || providerBlocked(); $('validate-credentials').disabled=busy; $('cancel').disabled=!busy || !deploymentId; $('provider').disabled=busy; $('country').disabled=busy; $('location').disabled=busy; updateActionButtons(); }
+function setBusy(busy){ uiBusy=busy; $('deploy').disabled=busy || providerBlocked(); $('validate-credentials').disabled=busy; $('cancel').disabled=!busy || !deploymentId; $('provider').disabled=busy; $('country').disabled=busy; $('location').disabled=busy; $('expiration').disabled=busy; $('client-count').disabled=busy; updateActionButtons(); }
 function stateLabel(value){ return String(value).replaceAll('_',' ').replace(/^./,(c)=>c.toUpperCase()); }
 function renderSteps(state){ $('steps').replaceChildren(...STATES.map((value)=>{ const li=document.createElement('li'); li.textContent=stateLabel(value); const index=STATES.indexOf(state); li.className=STATES.indexOf(value)<index?'done':value===state?'active':''; return li; })); }
 function providerBlocked(){ return legacyStates.some((item)=>item.provider_id===$('provider').value && item.blocking); }
@@ -20,30 +21,32 @@ function setState(record, expectedId=deploymentId){
   const state=currentRecord.state||'idle'; $('status-text').textContent=RecoveryState.cloudInitStatus(currentRecord)||stateLabel(state); $('status-dot').className=`status-indicator ${state}`;
   $('ip-address').textContent=currentRecord.public_ip||'—'; $('copy-ip').disabled=!currentRecord.public_ip;
   $('expires').textContent=currentRecord.expires_at?new Date(currentRecord.expires_at).toLocaleString():'—';
+  updateSessionEstimate();
   updateActionButtons();
   renderSteps(state);
   return true;
 }
 function resetDeploymentState(){
   deploymentId=null; activeDeploymentId=null; currentRecord=null; selectedRecoveryId=null;
-  $('logs').textContent=''; $('qr-row').classList.add('hidden'); resetConfigExport();
+  $('logs').textContent=''; $('qr-row').classList.add('hidden'); resetClientConfigs();
   $('status-text').textContent='Idle'; $('status-dot').className='status-indicator idle';
   $('ip-address').textContent='—'; $('copy-ip').disabled=true; $('expires').textContent='—';
+  $('running-label').textContent='Running'; $('running-time').textContent='—'; $('estimated-cost').textContent='Unavailable';
   $('destroy').disabled=true; $('remove-local').disabled=true; renderSteps('idle');
 }
 function refreshLocations(){ const provider=selectedProvider(); locations=provider?.locations||[]; const countries=[...new Map(locations.map((l)=>[l.country_code,l.country_name])).entries()]; $('country').replaceChildren(); countries.forEach(([id,name])=>option($('country'),id,name)); refreshRegions(); setBusy(false); }
 function refreshRegions(){ const country=$('country').value; const values=locations.filter((l)=>l.country_code===country); $('location').replaceChildren(); values.forEach((l)=>option($('location'),l.id,`${l.city} — ${l.region}`)); refreshBadges(); }
-function refreshBadges(){ const location=selectedLocation(); if(!location)return; $('server-type').textContent=location.server_type; $('streaming').textContent=location.streaming_status; $('cost').textContent=location.estimated_hourly_cost_usd==null?'Cost unavailable':`~$${location.estimated_hourly_cost_usd.toFixed(3)}/hour`; }
+function refreshBadges(){ const location=selectedLocation(); if(!location)return; $('server-type').textContent=location.server_type; $('streaming').textContent=location.streaming_status; $('cost').textContent=location.estimated_hourly_cost_usd==null?'Estimated cost unavailable':`~$${location.estimated_hourly_cost_usd.toFixed(3)}/hour`; }
 function deploymentOptions(){
-  const allowed=$('traffic-mode').value==='ipv4'?['0.0.0.0/0']:$('allowed-ips').value.split(',').map(v=>v.trim()).filter(Boolean);
-  const dns=$('dns').value.split(',').map(v=>v.trim()).filter(Boolean); if(!dns.length)throw new Error('Enter at least one DNS server.');
-  return {allowed_ips:allowed,enable_ipv6:false,dns_servers:dns,wireguard_port:Number($('port').value),client_mtu:1420,persistent_keepalive:25,ssh_cidr:$('ssh-cidr').value.trim()||null,expiration_minutes:$('expiration').value?Number($('expiration').value):null,automatic_expiration:Boolean($('expiration').value)};
+  const clientCount=Number($('client-count').value);
+  if(!Number.isInteger(clientCount)||clientCount<1||clientCount>10)throw new Error('VPN clients must be between 1 and 10.');
+  return {client_count:clientCount,expiration_minutes:$('expiration').value?Number($('expiration').value):null,automatic_expiration:Boolean($('expiration').value)};
 }
 async function deploy(){
   if(providerBlocked())throw new Error('This provider has unreconciled legacy Terraform state. Review the recovery warning first.');
   if(operationId||activeDeploymentId)throw new Error('Another deployment operation is already active.');
   selectedRecoveryId=null;
-  setBusy(true); startedAt=Date.now(); startTimer();
+  setBusy(true);
   const response=await api().start_deploy($('provider').value,$('location').value,deploymentOptions());
   if(response.status!=='started')throw new Error(response.message||'Deployment could not be started.');
   const startedOperationId=response.operation_id; operationId=startedOperationId;
@@ -59,7 +62,7 @@ async function deploy(){
         if(result.deployment_id!==activeDeploymentId)throw new Error('Backend returned a mismatched deployment operation.');
         try{setState(await api().get_status(activeDeploymentId),activeDeploymentId);selectedRecoveryId=activeDeploymentId;}catch{selectedRecoveryId=null;}
         if(result.status!=='success')throw new Error(result.message);
-        await showConfig(result.config); break;
+        await showClients(activeDeploymentId); break;
       }
       await sleep(500);
     }
@@ -75,30 +78,47 @@ async function refreshLogs(targetId=deploymentId){
   $('logs').textContent=lines.join('\n'); $('logs').scrollTop=$('logs').scrollHeight;
 }
 function resetConfigExport(){configExportProposal=null;$('config-save-path').textContent='Preparing Desktop location…';$('config-save-status').textContent='';$('save-config').disabled=true;}
-async function loadConfigExport(targetId=deploymentId){
-  resetConfigExport(); if(!targetId)return;
-  const proposal=await api().get_client_config_export(targetId);
-  if(targetId!==deploymentId||proposal.deployment_id!==targetId)return;
+function resetClientConfigs(){clientMetadata=[];selectedClientId=null;$('client-list').replaceChildren();$('qrcode').replaceChildren();resetConfigExport();}
+function renderClientTabs(targetId){
+  $('client-list').replaceChildren(...clientMetadata.map((client)=>{const button=document.createElement('button');button.className=`client-tab${client.id===selectedClientId?' active':''}`;button.textContent=client.display_name;button.onclick=()=>selectClient(targetId,client.id).catch(()=>{});return button;}));
+}
+async function loadConfigExport(targetId,clientId){
+  resetConfigExport();
+  const proposal=await api().get_client_config_export(targetId,clientId);
+  if(targetId!==deploymentId||clientId!==selectedClientId||proposal.deployment_id!==targetId||proposal.client_id!==clientId)return;
   configExportProposal=proposal;$('config-save-path').textContent=proposal.path;$('save-config').disabled=false;
 }
-async function showConfig(config,targetId=deploymentId){
-  const node=$('qrcode'); $('qr-row').classList.remove('hidden'); node.replaceChildren();
+async function selectClient(targetId,clientId){
+  if(targetId!==deploymentId||!clientMetadata.some((client)=>client.id===clientId))return;
+  selectedClientId=clientId;renderClientTabs(targetId);resetConfigExport();
+  const selected=clientMetadata.find((client)=>client.id===clientId);$('selected-client-name').textContent=selected?.display_name||'Client';
+  const node=$('qrcode');node.replaceChildren();node.textContent='Loading client configuration…';
+  let config;
+  try{config=await api().get_client_config(targetId,clientId);}catch{if(targetId===deploymentId&&clientId===selectedClientId)node.textContent='Client configuration unavailable.';return;}
+  if(targetId!==deploymentId||clientId!==selectedClientId)return;
+  node.replaceChildren();
   if(window.QRCode){new QRCode(node,{text:config,width:152,height:152,correctLevel:QRCode.CorrectLevel.M});}else{node.textContent='QR library unavailable. Save the configuration instead.';}
-  try{await loadConfigExport(targetId);}catch{$('config-save-path').textContent='Desktop save location unavailable';$('save-config').disabled=true;}
+  try{await loadConfigExport(targetId,clientId);}catch{if(targetId===deploymentId&&clientId===selectedClientId){$('config-save-path').textContent='Desktop save location unavailable';$('save-config').disabled=true;}}
+}
+async function showClients(targetId=deploymentId){
+  resetClientConfigs();if(!targetId)return;
+  const clients=await api().get_client_configs(targetId);
+  if(targetId!==deploymentId||!Array.isArray(clients)||!clients.length)return;
+  clientMetadata=clients;$('qr-row').classList.remove('hidden');await selectClient(targetId,clients[0].id);
 }
 async function saveConfig(){
-  const targetId=deploymentId;if(!targetId||!configExportProposal||configExportProposal.deployment_id!==targetId)return;
+  const targetId=deploymentId;const clientId=selectedClientId;if(!targetId||!clientId||!configExportProposal||configExportProposal.deployment_id!==targetId||configExportProposal.client_id!==clientId)return;
   $('save-config').disabled=true;$('config-save-status').textContent='';
   try{
-    const result=await api().save_client_config(targetId);
-    if(targetId!==deploymentId)return;
+    const result=await api().save_client_config(targetId,clientId);
+    if(targetId!==deploymentId||clientId!==selectedClientId)return;
     if(result.status==='cancelled'){$('config-save-status').textContent='Save cancelled.';return;}
     if(result.status!=='success')throw new Error(result.message||'Configuration could not be saved.');
     $('config-save-path').textContent=result.path;$('config-save-status').textContent=`Configuration saved: ${result.path}`;
-  }catch(e){if(targetId===deploymentId){$('config-save-status').textContent='Configuration was not saved.';alert(e.message);}}
-  finally{if(targetId===deploymentId)$('save-config').disabled=false;}
+  }catch(e){if(targetId===deploymentId&&clientId===selectedClientId){$('config-save-status').textContent='Configuration was not saved.';alert(e.message);}}
+  finally{if(targetId===deploymentId&&clientId===selectedClientId)$('save-config').disabled=false;}
 }
-async function destroy(){ if(!deploymentId||!confirm('Destroy this deployment and remove sensitive local recovery artifacts?'))return; setBusy(true); try{const result=await api().destroy(deploymentId,false); if(result.status!=='success')throw new Error(result.message); setState(await api().get_status(deploymentId)); $('qr-row').classList.add('hidden');resetConfigExport();}catch(e){alert(e.message);} finally{setBusy(false); await loadRecovery();} }
+async function destroy(){ if(!deploymentId||!confirm('Destroy this deployment and remove sensitive local recovery artifacts?'))return; setBusy(true); try{const result=await api().destroy(deploymentId,false); if(result.status!=='success')throw new Error(result.message); setState(await api().get_status(deploymentId));selectedRecoveryId=null;$('qr-row').classList.add('hidden');resetClientConfigs();}catch(e){alert(e.message);} finally{setBusy(false); await loadRecovery();} }
 async function removeLocal(){
   if(!deploymentId||selectedRecoveryId!==deploymentId)return;
   try{await api().get_status(deploymentId);}catch{resetDeploymentState();await loadRecovery();return;}
@@ -111,7 +131,7 @@ async function selectRecovery(item){
     const fresh=await api().get_status(item.id);
     if(!fresh||fresh.id!==item.id)throw new Error('Recovery deployment no longer exists.');
     selectedRecoveryId=item.id; deploymentId=item.id; currentRecord=null; setState(fresh,item.id); await refreshLogs(item.id);
-    if(fresh.state==='ready')await showConfig(await api().get_client_config(item.id),item.id);else{$('qr-row').classList.add('hidden');resetConfigExport();}
+    if(fresh.state==='ready')await showClients(item.id);else{$('qr-row').classList.add('hidden');resetClientConfigs();}
   }catch{resetDeploymentState();await loadRecovery();}
 }
 async function loadRecovery(){
@@ -150,7 +170,7 @@ async function reconcileStale(item){
   try{await api().reconcile_stale_legacy_state(item.provider_id,true);await loadLegacyStates();await loadRecovery();}catch(e){alert(e.message);await loadLegacyStates();}
 }
 async function loadLegacyStates(){
-  legacyStates=await api().list_legacy_states(); const visible=legacyStates.filter((item)=>item.classification!=='none');
+  legacyStates=await api().list_legacy_states(); const visible=legacyStates.filter((item)=>item.blocking);
   $('legacy-recovery').classList.toggle('hidden',!visible.length);
   $('legacy-list').replaceChildren(...visible.map((item)=>{
     const row=document.createElement('div');row.className='recovery-item legacy-item';
@@ -161,10 +181,16 @@ async function loadLegacyStates(){
     return row;
   })); setBusy(false);
 }
-function startTimer(){ clearInterval(timer); timer=setInterval(()=>{if(startedAt){const seconds=Math.floor((Date.now()-startedAt)/1000);$('elapsed').textContent=`${String(Math.floor(seconds/60)).padStart(2,'0')}:${String(seconds%60).padStart(2,'0')}`;}},1000); }
+function updateSessionEstimate(){
+  const estimate=SessionCost.estimate(currentRecord,Date.now());
+  $('running-label').textContent=estimate.finalized?'Session duration':'Running';
+  $('running-time').textContent=SessionCost.formatDuration(estimate.elapsedSeconds);
+  $('estimated-cost').textContent=SessionCost.formatCost(estimate.costUsd);
+}
+function startTimer(){clearInterval(timer);timer=setInterval(updateSessionEstimate,1000);updateSessionEstimate();}
 async function validateCredentials(){const result=await api().validate_credentials($('provider').value);alert(result.message);}
-async function initialize(){ if(!api()){setTimeout(initialize,100);return;} providers=await api().list_providers(); $('provider').replaceChildren(); providers.forEach((p)=>option($('provider'),p.id,p.display_name)); refreshLocations(); renderSteps('idle'); await loadLegacyStates(); await loadRecovery(); setInterval(()=>{if(!document.hidden)reconcileCurrentDeployment().catch(()=>{});},1000); setInterval(()=>{if(!document.hidden)loadRecovery().catch(()=>{});},5000); }
-$('provider').addEventListener('change',()=>{refreshLocations();setBusy(false);}); $('country').addEventListener('change',refreshRegions); $('location').addEventListener('change',refreshBadges); $('traffic-mode').addEventListener('change',()=>{$('allowed-ips').disabled=$('traffic-mode').value!=='custom';if($('traffic-mode').value==='ipv4')$('allowed-ips').value='0.0.0.0/0';});
+async function initialize(){ if(!api()){setTimeout(initialize,100);return;} providers=await api().list_providers(); $('provider').replaceChildren(); providers.forEach((p)=>option($('provider'),p.id,p.display_name)); refreshLocations(); renderSteps('idle'); startTimer(); await loadLegacyStates(); await loadRecovery(); setInterval(()=>{if(!document.hidden)reconcileCurrentDeployment().catch(()=>{});},1000); setInterval(()=>{if(!document.hidden)loadRecovery().catch(()=>{});},5000); }
+$('provider').addEventListener('change',()=>{refreshLocations();setBusy(false);}); $('country').addEventListener('change',refreshRegions); $('location').addEventListener('change',refreshBadges);
 $('deploy').addEventListener('click',()=>deploy().catch((e)=>{alert(e.message);setBusy(Boolean(operationId||activeDeploymentId));})); $('validate-credentials').addEventListener('click',()=>validateCredentials().catch((e)=>alert(e.message))); $('destroy').addEventListener('click',destroy); $('remove-local').addEventListener('click',removeLocal); $('cancel').addEventListener('click',async()=>{if(deploymentId)await api().cancel(deploymentId);});
 $('copy-ip').addEventListener('click',()=>navigator.clipboard.writeText($('ip-address').textContent)); $('save-config').addEventListener('click',()=>saveConfig());
 window.addEventListener('beforeunload',(event)=>{if(currentRecord?.resources_possible&&currentRecord.state!=='destroyed'){event.preventDefault();event.returnValue='Active cloud resources may still exist.';}}); document.addEventListener('DOMContentLoaded',initialize);

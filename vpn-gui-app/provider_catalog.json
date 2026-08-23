@@ -46,14 +46,6 @@
         {"id":"ap-southeast-2","country_code":"AU","country_name":"Australia","city":"Sydney","region":"ap-southeast-2","server_type":"cloud","capabilities":["wireguard","ipv4","static-ip"],"streaming_status":"unverified","estimated_hourly_cost_usd":0.005},
         {"id":"sa-east-1","country_code":"BR","country_name":"Brazil","city":"Sao Paulo","region":"sa-east-1","server_type":"cloud","capabilities":["wireguard","ipv4","static-ip"],"streaming_status":"unverified","estimated_hourly_cost_usd":0.005}
       ]
-    },
-    {
-      "id": "residential",
-      "display_name": "User-owned residential node",
-      "terraform_root": null,
-      "locations": [
-        {"id":"imported-node","country_code":"ZZ","country_name":"User supplied","city":"User supplied","region":"external","server_type":"residential","capabilities":["imported-wireguard"],"streaming_status":"residential","description":"Future interface for a trusted, user-owned WireGuard endpoint; not cloud-provisioned."}
-      ]
     }
   ]
 }

@@ -4,10 +4,12 @@ import base64
 import binascii
 import hashlib
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import yaml
+from client_peers import MAX_CLIENTS, MIN_CLIENTS, client_tunnel_ipv4
 
 CLOUD_CONFIG_PROVIDERS = frozenset({"digitalocean", "scaleway"})
 SHELL_SCRIPT_PROVIDERS = frozenset({"aws-lightsail"})
@@ -62,7 +64,7 @@ def render_user_data(
     *,
     wireguard_port: int,
     server_private_key: str,
-    client_public_key: str,
+    client_peers: Sequence[dict[str, object]],
 ) -> str:
     """Render and validate the exact user-data string passed to Terraform."""
     if provider_id not in SUPPORTED_PROVIDERS:
@@ -73,7 +75,7 @@ def render_user_data(
     replacements = {
         "@@WIREGUARD_PORT@@": str(wireguard_port),
         "@@SERVER_PRIVATE_KEY@@": _wireguard_key(server_private_key, "Server WireGuard key"),
-        "@@CLIENT_PUBLIC_KEY@@": _wireguard_key(client_public_key, "Client WireGuard key"),
+        "@@CLIENT_PEERS@@": _render_client_peers(client_peers),
         "@@BOOTSTRAP_FINGERPRINT@@": source_sha256[:12],
     }
     bootstrap = _read_template(common_root / "bootstrap.sh.tftpl")
@@ -94,6 +96,28 @@ def render_user_data(
 
     validate_user_data_payload(provider_id, payload)
     return payload
+
+
+def _render_client_peers(client_peers: Sequence[dict[str, object]]) -> str:
+    if not MIN_CLIENTS <= len(client_peers) <= MAX_CLIENTS:
+        raise UserDataValidationError(f"User-data requires between {MIN_CLIENTS} and {MAX_CLIENTS} clients")
+    blocks: list[str] = []
+    public_keys: set[str] = set()
+    addresses: set[str] = set()
+    for index, peer in enumerate(client_peers, start=1):
+        public_key_raw = peer.get("public_key")
+        tunnel_ipv4_raw = peer.get("tunnel_ipv4")
+        if not isinstance(public_key_raw, str) or not isinstance(tunnel_ipv4_raw, str):
+            raise UserDataValidationError("Client peer metadata is malformed")
+        public_key = _wireguard_key(public_key_raw, f"Client {index} WireGuard key")
+        if tunnel_ipv4_raw != client_tunnel_ipv4(index):
+            raise UserDataValidationError("Client peer tunnel address is outside the deterministic allocation")
+        if public_key in public_keys or tunnel_ipv4_raw in addresses:
+            raise UserDataValidationError("Client peers must have unique public keys and tunnel addresses")
+        public_keys.add(public_key)
+        addresses.add(tunnel_ipv4_raw)
+        blocks.append(f"[Peer]\nPublicKey = {public_key}\nAllowedIPs = {tunnel_ipv4_raw}/32")
+    return "\n\n".join(blocks)
 
 
 def validate_user_data_payload(provider_id: str, payload: str) -> None:

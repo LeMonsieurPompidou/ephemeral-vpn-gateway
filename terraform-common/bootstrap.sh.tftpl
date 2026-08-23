@@ -140,9 +140,7 @@ PrivateKey = @@SERVER_PRIVATE_KEY@@
 PostUp = OUTBOUND_IFACE="$(ip route show default | awk '/default/ {print $5; exit}')"; iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o "$OUTBOUND_IFACE" -j MASQUERADE
 PostDown = OUTBOUND_IFACE="$(ip route show default | awk '/default/ {print $5; exit}')"; iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o "$OUTBOUND_IFACE" -j MASQUERADE
 
-[Peer]
-PublicKey = @@CLIENT_PUBLIC_KEY@@
-AllowedIPs = 10.8.0.2/32
+@@CLIENT_PEERS@@
 WG_CONFIG
 chmod 0600 /etc/wireguard/wg0.conf
 wg-quick strip wg0 >/dev/null

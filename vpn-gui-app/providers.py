@@ -116,22 +116,6 @@ class AwsLightsailAdapter(TerraformProviderAdapter):
         return False, f"AWS credentials for profile {profile} are unavailable. Run: aws sso login --profile {profile}"
 
 
-class ResidentialProviderAdapter:
-    def __init__(self, info: ProviderInfo) -> None:
-        self.info = info
-
-    def list_locations(self) -> tuple[Location, ...]:
-        return self.info.locations
-
-    def validate_credentials(self, cancel: threading.Event | None = None) -> tuple[bool, str]:
-        if cancel and cancel.is_set():
-            raise TerraformCancelled("Deployment cancelled during credential validation")
-        return False, "Residential nodes must be imported by the user and are not provisioned by Terraform"
-
-    def terraform_variables(self, location: Location, options: DeploymentOptions) -> dict[str, object]:
-        raise NotImplementedError("Residential node import is a future, non-cloud interface")
-
-
 class ProviderRegistry:
     def __init__(self, catalog: ProviderCatalog) -> None:
         self.catalog = catalog
@@ -150,7 +134,6 @@ class ProviderRegistry:
                 credential_file=Path.home() / ".aws" / "credentials",
             )
         )
-        self.register(ResidentialProviderAdapter(catalog.get_provider("residential")))
 
     def register(self, provider: ProviderAdapter) -> None:
         if provider.info.id in self._providers:

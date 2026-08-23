@@ -7,10 +7,12 @@ Ephemeral VPN Gateway provisions short-lived WireGuard gateways through Terrafor
 The primary UI is deliberately small:
 
 ```text
-Provider -> Country -> Location -> Lifetime -> Deploy -> Connect
+Provider -> Country -> Location -> Lifetime -> VPN clients -> Deploy -> Connect
 ```
 
-Routing mode, custom `AllowedIPs`, DNS, WireGuard port, and an optional manual SSH source `/32` are under **Advanced settings**. MTU 1420 and persistent keepalive 25 are automatic tested defaults. Full-tunnel mode always produces `0.0.0.0/0`.
+The normal GUI intentionally uses the validated defaults: IPv4 full tunnel (`AllowedIPs = 0.0.0.0/0`), DNS `1.1.1.1` and `1.0.0.1`, WireGuard UDP port 51820, MTU 1420, persistent keepalive 25, and automatic SSH source-address detection. These remain backend options for tests and future expert workflows, but infrastructure controls are not shown in the normal product flow.
+
+Select one VPN client for every phone, computer, or other device (1 to 10). Every client receives a unique WireGuard keypair and tunnel address, with its own QR code and Desktop-exportable `.conf`. **Do not reuse the same WireGuard client configuration on multiple devices. Create/select one client per device.**
 
 `Lifetime` is local, best-effort cleanup. It is persisted and retried after the application restarts, but it cannot destroy resources while the computer is off, the application is not running, or provider credentials are unavailable. There is currently no provider-side TTL service.
 
@@ -35,8 +37,11 @@ EphemeralVpnGateway\
     |-- terraform.tfstate.backup       (when Terraform creates one)
     |-- deployment.tfplan
     |-- deployment.auto.tfvars.json
-    |-- client.privatekey
-    |-- client.conf                    (after apply)
+    |-- clients\
+    |   |-- client-1\
+    |   |   |-- client.privatekey
+    |   |   `-- client.conf            (after apply)
+    |   `-- client-N\ ...
     |-- ssh.privatekey
     |-- ssh.publickey
     |-- known_hosts
@@ -50,6 +55,8 @@ Provider operations also use an OS/filesystem lock. Registry replacement is atom
 ## Legacy provider-root state recovery
 
 Older versions could write ignored `terraform.tfstate` files into `vpn-aws-lightsail`, `vpn-digitalocean`, or `vpn-scaleway`. Startup inspects primary and backup files without changing them and classifies them as empty, active, malformed, ambiguous, or migrated.
+
+The GUI hides this internal recovery section when every provider is empty, validly migrated, or validly reconciled stale. It appears only when at least one provider has genuinely blocking legacy state.
 
 - Active, malformed, and ambiguous state blocks a new deployment for that provider.
 - The original state is never deleted, overwritten, moved, merged, or destroyed automatically.
@@ -90,7 +97,7 @@ Ignored legacy `terraform.tfvars` credentials remain accepted for migration comp
 
 ## SSH readiness and source address
 
-Immediately before planning, the application requests its public IPv4 from `https://checkip.amazonaws.com/`, validates that it is globally routable, and uses the exact `/32` in the provider firewall. Detection has a short timeout, never falls back to `0.0.0.0/0`, and does not log the address. A manual public IPv4 `/32` override is available under Advanced settings.
+Immediately before planning, the application requests its public IPv4 from `https://checkip.amazonaws.com/`, validates that it is globally routable, and uses the exact `/32` in the provider firewall. Detection has a short timeout, never falls back to `0.0.0.0/0`, and does not log the address. A manual override remains available through the backend options for diagnostics, not the normal GUI.
 
 If SSH readiness fails and automatic redetection returns a different address, the application performs one controlled Terraform plan/apply to update the SSH rule, then retries. It does not loop indefinitely.
 
@@ -106,7 +113,7 @@ Readiness checks wait for cloud-init and verify the marker, `wg-quick@wg0`, the 
 
 ## Lifecycle, cancellation, and recovery
 
-Durable registry metadata records plan/apply timestamps, state presence, whether cloud resources may exist, cleanup status, expiry, and legacy migration provenance.
+Durable registry metadata records plan/apply timestamps, state presence, whether cloud resources may exist, cleanup status, expiry, non-secret client identities/addresses, the catalog hourly-price snapshot, and legacy migration provenance. Client private keys are never stored in the registry.
 
 - Before apply starts, cancellation means cloud resources cannot have been created. The UI offers **Remove local deployment**, which removes the runtime and registry record.
 - From immediately before apply onward, the application conservatively assumes resources may exist. State and recovery material are retained and the UI offers **Destroy cloud resources**.
@@ -118,7 +125,11 @@ Do not delete state for a partial apply. If state is missing after apply may hav
 
 ## Keys, logs, and sensitive cleanup
 
-WireGuard server and client keypairs are generated locally with Python `cryptography` X25519. Users do not run `wg genkey`. Terraform receives the server private/public keys and client public key; it never receives the client private key.
+WireGuard server and client keypairs are generated locally with Python `cryptography` X25519. Users do not run `wg genkey`. Terraform receives the server private/public keys and a typed list containing each client's public key and `/32` tunnel address. It never receives a client private key. The server configuration contains one peer block per client.
+
+At Ready, select a client to display only that client's QR code and Desktop export. A single-client deployment keeps the backward-friendly `heres-vpn-<location>-<deployment>.conf` name. Multi-client exports add `-client-1`, `-client-2`, and so on. Windows resolves the real Desktop known folder, including redirected/OneDrive Desktops, before opening native Save As. The protected runtime copy remains authoritative.
+
+The status card estimates session cost from the catalog's numeric hourly estimate and elapsed time since `apply_started_at`. The timer freezes at confirmed `destroyed_at`; requesting destroy does not stop it. This is an estimate only: provider rounding, minimum charges, taxes, and other resources can make actual billing differ. Locations without verified pricing display **Unavailable**. No billing API is queried.
 
 Saved plans, tfvars, and state are sensitive because they contain server provisioning material. Runtime files use restrictive modes where supported and inherit the user's protected application-data ACL on Windows.
 
@@ -133,6 +144,8 @@ After Terraform confirms successful destruction, the application removes:
 - the temporary SSH keypair and deployment `known_hosts`
 
 Only sanitized tombstone metadata and the bounded redacted log remain. Failed destruction preserves all recovery-required material.
+
+The provider selector contains only implemented Terraform providers: AWS Lightsail, DigitalOcean, and Scaleway. A user-owned residential exit remains a possible roadmap direction but is not offered as a deployable provider.
 
 ## Development and validation
 

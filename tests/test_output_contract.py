@@ -26,6 +26,19 @@ def test_all_terraform_roots_declare_backend_and_output_contract() -> None:
             assert f'output "{output}"' in main
 
 
+def test_all_terraform_roots_use_typed_multi_client_public_peer_contract() -> None:
+    for provider in PROVIDERS:
+        main = (ROOT / provider / "main.tf").read_text(encoding="utf-8")
+        variables = (ROOT / provider / "variables.tf").read_text(encoding="utf-8")
+        assert 'variable "client_peers"' in variables
+        assert "type = list(object({" in variables
+        assert "public_key  = string" in variables
+        assert "tunnel_ipv4 = string" in variables
+        assert "local.client_peer_config" in main
+        assert '"@@CLIENT_PEERS@@"' in main
+        assert "@@CLIENT_PUBLIC_KEY@@" not in main
+
+
 @pytest.mark.parametrize("missing", REQUIRED_TERRAFORM_OUTPUTS)
 def test_contract_reports_every_missing_key(missing: str) -> None:
     outputs = valid_outputs()

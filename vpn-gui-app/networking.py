@@ -37,6 +37,6 @@ def detect_public_ipv4(timeout: float = 5.0) -> str:
             body = response.read(128).decode("ascii", errors="strict")
     except Exception as exc:
         raise PublicIpDetectionError(
-            "Could not detect the current public IPv4 address. Retry or enter a manual /32 in Advanced settings."
+            "Could not detect the current public IPv4 address. Retry after checking network connectivity."
         ) from exc
     return normalize_public_ipv4_cidr(body)

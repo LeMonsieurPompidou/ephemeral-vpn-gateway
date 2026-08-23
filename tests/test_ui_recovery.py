@@ -89,9 +89,38 @@ def test_client_configuration_ui_shows_backend_desktop_path_and_preserves_qr() -
     assert "Mobile" in index and 'id="qrcode"' in index
     assert "Desktop" in index and "Save location" in index
     assert 'id="config-save-path"' in index
-    assert "get_client_config_export(targetId)" in script
+    assert 'id="client-count"' in index and 'value="1"' in index
+    assert "One client per device." in index
+    assert 'id="client-list"' in index
+    assert "get_client_configs(targetId)" in script
+    assert "get_client_config_export(targetId,clientId)" in script
     assert "proposal.path" in script
-    assert "save_client_config(targetId)" in script
+    assert "save_client_config(targetId,clientId)" in script
     assert "Configuration saved: ${result.path}" in script
     assert "Save to an absolute path" not in script
     assert "new QRCode" in script
+
+
+def test_normal_gui_hides_internal_advanced_controls_and_healthy_legacy_states() -> None:
+    index = (ROOT / "vpn-gui-app" / "ui" / "index.html").read_text(encoding="utf-8")
+    script = (ROOT / "vpn-gui-app" / "ui" / "script.js").read_text(encoding="utf-8")
+    assert "Advanced settings" not in index
+    for internal_id in ("traffic-mode", "allowed-ips", "dns", "port", "ssh-cidr"):
+        assert f'id="{internal_id}"' not in index
+        assert f"$('{internal_id}')" not in script
+    assert "allowed_ips:" not in script
+    assert "wireguard_port:" not in script
+    assert "legacyStates.filter((item)=>item.blocking)" in script
+    assert "classification!=='none'" not in script
+
+
+def test_running_time_and_estimated_cost_are_present_and_driven_locally() -> None:
+    index = (ROOT / "vpn-gui-app" / "ui" / "index.html").read_text(encoding="utf-8")
+    script = (ROOT / "vpn-gui-app" / "ui" / "script.js").read_text(encoding="utf-8")
+    assert 'src="session_cost.js"' in index
+    assert 'id="running-time"' in index
+    assert 'id="estimated-cost"' in index
+    assert "Actual billing may differ" in index
+    assert "SessionCost.estimate(currentRecord,Date.now())" in script
+    assert "setInterval(updateSessionEstimate,1000)" in script
+    assert "setState(await api().get_status(deploymentId));selectedRecoveryId=null" in script

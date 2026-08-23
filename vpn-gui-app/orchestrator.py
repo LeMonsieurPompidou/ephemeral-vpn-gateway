@@ -17,10 +17,18 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterator
 
 from catalog import ProviderCatalog
+from client_peers import (
+    CLIENT_SCHEMA_VERSION,
+    ClientPeer,
+    client_tunnel_ipv4,
+    generate_client_peers,
+    resolve_client_path,
+    validate_client_count,
+)
 from cloud_init import FAILURE_MARKER, READINESS_MARKER, bootstrap_source_sha256, render_user_data
 from file_lock import FileLock
 from legacy_reconciliation import LegacyReconciliationStore
-from models import DeploymentOptions, DeploymentRecord, DeploymentState, StatusEvent, now_iso
+from models import ClientMetadata, DeploymentOptions, DeploymentRecord, DeploymentState, StatusEvent, now_iso
 from networking import PublicIpDetectionError, detect_public_ipv4, normalize_public_ipv4_cidr
 from output_contract import ProviderOutputs, validate_provider_outputs
 from providers import ProviderRegistry
@@ -211,9 +219,9 @@ class Orchestrator:
         """Atomically reserve and persist a deployment before exposing its ID."""
         validate_options(options)
         provider = self.providers.get(provider_id)
-        self.catalog.get_location(provider_id, location_id)
+        location = self.catalog.get_location(provider_id, location_id)
         if not provider.info.terraform_root:
-            raise ValueError("Residential node import is not implemented yet")
+            raise ValueError("The selected provider is not available for deployment")
         terraform_directory = self._provider_directory(provider_id)
         with self._deployment_creation_transaction():
             blocking = [record for record in self.deployments.list() if record.state != DeploymentState.DESTROYED]
@@ -238,6 +246,7 @@ class Orchestrator:
                 now_iso(),
                 expires_at=expires,
                 auto_expire=options.automatic_expiration,
+                estimated_hourly_cost_usd=location.estimated_hourly_cost_usd,
             )
             self._assert_record_paths(record)
             try:
@@ -283,7 +292,7 @@ class Orchestrator:
         provider = self.providers.get(provider_id)
         location = self.catalog.get_location(provider_id, location_id)
         if not provider.info.terraform_root:
-            raise ValueError("Residential node import is not implemented yet")
+            raise ValueError("The selected provider is not available for deployment")
         record = (
             self.deployments.get(str(deployment_id))
             if reserved
@@ -317,11 +326,17 @@ class Orchestrator:
                 )
 
             server_private, server_public = generate_wireguard_keypair()
-            client_private, client_public = generate_wireguard_keypair()
+            client_peers = generate_client_peers(options.client_count, generate_wireguard_keypair)
             ssh_private, ssh_public = generate_ssh_keypair()
-            write_secret(runtime / "client.privatekey", client_private + "\n")
+            for peer in client_peers:
+                private_path = resolve_client_path(runtime, peer.private_key_relative_path)
+                private_path.parent.mkdir(parents=True, exist_ok=True)
+                write_secret(private_path, peer.private_key + "\n")
             write_secret(runtime / "ssh.privatekey", ssh_private)
             write_secret(runtime / "ssh.publickey", ssh_public + "\n")
+            record.client_schema_version = CLIENT_SCHEMA_VERSION
+            record.clients = [peer.metadata() for peer in client_peers]
+            self.deployments.save(record)
             self._raise_if_cancelled(cancel)
 
             self._stage_terraform_configuration(record)
@@ -343,7 +358,7 @@ class Orchestrator:
                     staged_common,
                     wireguard_port=effective_options.wireguard_port,
                     server_private_key=server_private,
-                    client_public_key=client_public,
+                    client_peers=[peer.terraform_peer() for peer in client_peers],
                 )
                 self._write_user_data_manifest(record, staged_common, user_data_payload)
                 variables = provider.terraform_variables(location, effective_options)
@@ -353,7 +368,7 @@ class Orchestrator:
                         "expires_at": expires,
                         "server_private_key": server_private,
                         "server_public_key": server_public,
-                        "client_public_key": client_public,
+                        "client_peers": [peer.terraform_peer() for peer in client_peers],
                         "ssh_public_key": ssh_public,
                         "user_data_payload": user_data_payload,
                     }
@@ -405,7 +420,7 @@ class Orchestrator:
                 record,
                 contract,
                 effective_options,
-                client_private,
+                client_peers,
                 cancel,
                 automatic_ssh_cidr=not manual_ssh_cidr,
             )
@@ -415,7 +430,7 @@ class Orchestrator:
                 "deployment_id": identifier,
                 "state": record.state.value,
                 "ip": record.public_ip,
-                "config": self.get_client_config(identifier),
+                "clients": self.list_client_configs(identifier),
                 "expires_at": record.expires_at,
             }
         except TerraformCancelled as exc:
@@ -435,15 +450,23 @@ class Orchestrator:
         record: DeploymentRecord,
         outputs: ProviderOutputs,
         options: DeploymentOptions,
-        client_private: str,
+        client_peers: list[ClientPeer],
         cancel: threading.Event,
         *,
         automatic_ssh_cidr: bool,
     ) -> None:
         self._raise_if_cancelled(cancel)
-        config = self._render_client_config(record.public_ip or "", outputs.server_public_key, client_private, options)
-        self._validate_client_config(config)
-        write_secret(Path(record.runtime_directory) / "client.conf", config)
+        runtime = Path(record.runtime_directory)
+        for peer in client_peers:
+            config = self._render_client_config(
+                record.public_ip or "",
+                outputs.server_public_key,
+                peer.private_key,
+                peer.tunnel_ipv4,
+                options,
+            )
+            self._validate_client_config(config)
+            write_secret(resolve_client_path(runtime, peer.config_relative_path), config)
         self._ssh_health_checks(
             record,
             options,
@@ -974,13 +997,17 @@ class Orchestrator:
 
     @staticmethod
     def _render_client_config(
-        public_ip: str, server_public: str, client_private: str, options: DeploymentOptions
+        public_ip: str,
+        server_public: str,
+        client_private: str,
+        tunnel_ipv4: str,
+        options: DeploymentOptions,
     ) -> str:
         return "\n".join(
             [
                 "[Interface]",
                 f"PrivateKey = {client_private}",
-                "Address = 10.8.0.2/32",
+                f"Address = {tunnel_ipv4}/32",
                 f"DNS = {', '.join(options.dns_servers)}",
                 f"MTU = {options.client_mtu}",
                 "",
@@ -1081,18 +1108,71 @@ class Orchestrator:
     def get_status(self, deployment_id: str) -> dict[str, object]:
         return self.deployments.get(deployment_id).to_dict()
 
-    def get_client_config(self, deployment_id: str) -> str:
-        return self.client_config_path(deployment_id).read_text(encoding="utf-8")
-
-    def client_config_path(self, deployment_id: str) -> Path:
+    def list_client_configs(self, deployment_id: str) -> list[dict[str, object]]:
         record = self.deployments.get(deployment_id)
         self._assert_record_paths(record)
-        path = Path(record.runtime_directory) / "client.conf"
+        return [
+            {
+                "id": client.id,
+                "index": client.index,
+                "display_name": client.display_name,
+                "tunnel_ipv4": client.tunnel_ipv4,
+            }
+            for client in self._client_metadata(record)
+        ]
+
+    def get_client_config(self, deployment_id: str, client_id: str | None = None) -> str:
+        return self.client_config_path(deployment_id, client_id).read_text(encoding="utf-8")
+
+    def client_config_path(self, deployment_id: str, client_id: str | None = None) -> Path:
+        record = self.deployments.get(deployment_id)
+        self._assert_record_paths(record)
+        clients = self._client_metadata(record)
+        selected_id = client_id or clients[0].id
+        matches = [client for client in clients if client.id == selected_id]
+        if len(matches) != 1:
+            raise RuntimeError("Unknown deployment client")
+        path = resolve_client_path(Path(record.runtime_directory), matches[0].config_relative_path)
         if record.state != DeploymentState.READY and not path.is_file():
             raise RuntimeError("Client configuration is not ready")
         if not path.is_file() or path.is_symlink():
             raise RuntimeError("Runtime client configuration is missing or unsafe")
         return path
+
+    @staticmethod
+    def _client_metadata(record: DeploymentRecord) -> list[ClientMetadata]:
+        if not record.clients:
+            return [
+                ClientMetadata(
+                    id="client-1",
+                    index=1,
+                    display_name="Client 1",
+                    tunnel_ipv4="10.8.0.2",
+                    config_relative_path="client.conf",
+                    private_key_relative_path="client.privatekey",
+                )
+            ]
+        ids = {client.id for client in record.clients}
+        indexes = {client.index for client in record.clients}
+        addresses = {client.tunnel_ipv4 for client in record.clients}
+        if not (
+            len(ids) == len(record.clients)
+            and len(indexes) == len(record.clients)
+            and len(addresses) == len(record.clients)
+        ):
+            raise RuntimeError("Deployment client metadata is ambiguous")
+        ordered = sorted(record.clients, key=lambda client: client.index)
+        validate_client_count(len(ordered))
+        for expected_index, client in enumerate(ordered, start=1):
+            if (
+                client.index != expected_index
+                or client.id != f"client-{expected_index}"
+                or client.tunnel_ipv4 != client_tunnel_ipv4(expected_index)
+            ):
+                raise RuntimeError("Deployment client metadata is invalid")
+            resolve_client_path(Path(record.runtime_directory), client.config_relative_path)
+            resolve_client_path(Path(record.runtime_directory), client.private_key_relative_path)
+        return ordered
 
     def get_logs(self, deployment_id: str) -> list[str]:
         record = self.deployments.get(deployment_id)
@@ -2098,6 +2178,14 @@ class Orchestrator:
             for path in runtime.glob(pattern):
                 if path.is_file():
                     path.unlink()
+        clients_root = runtime / "clients"
+        if clients_root.is_dir():
+            if preserve_config:
+                for private_key in clients_root.rglob("*.privatekey"):
+                    if private_key.is_file():
+                        private_key.unlink()
+            else:
+                shutil.rmtree(clients_root)
         terraform_data = runtime / ".terraform"
         if terraform_data.is_dir():
             shutil.rmtree(terraform_data)

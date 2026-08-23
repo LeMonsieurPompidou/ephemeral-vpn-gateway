@@ -15,7 +15,7 @@ from config_export import (
     resolve_desktop_directory,
 )
 from helpers import add_record, make_resource_root
-from models import DeploymentRecord, DeploymentState
+from models import ClientMetadata, DeploymentRecord, DeploymentState
 
 
 def ready_bridge(
@@ -84,6 +84,7 @@ def test_export_proposal_uses_backend_desktop_without_touching_runtime(
     assert proposal == {
         "status": "ready",
         "deployment_id": record.id,
+        "client_id": "client-1",
         "directory": str(desktop),
         "filename": "heres-vpn-us-east-1-a01784ba.conf",
         "path": str(desktop / "heres-vpn-us-east-1-a01784ba.conf"),
@@ -227,3 +228,52 @@ def test_export_cannot_overwrite_the_authoritative_runtime_copy(
     with pytest.raises(ConfigExportError, match="cannot be overwritten"):
         config_export.copy_config_bytes(source, source)
     assert source.read_bytes() == payload
+
+
+def test_multiple_clients_have_independent_desktop_names_and_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chosen: list[Path] = []
+
+    def dialog(directory: Path, filename: str) -> Path:
+        destination = directory / filename
+        chosen.append(destination)
+        return destination
+
+    bridge, record, desktop, _payload = ready_bridge(tmp_path, monkeypatch, save_dialog=dialog)
+    runtime = Path(record.runtime_directory)
+    (runtime / "client.conf").unlink()
+    record.client_schema_version = 1
+    record.clients = []
+    payloads = (b"client-one-private", b"client-two-private")
+    for index, payload in enumerate(payloads, start=1):
+        client_id = f"client-{index}"
+        relative = f"clients/{client_id}/client.conf"
+        source = runtime.joinpath(*relative.split("/"))
+        source.parent.mkdir(parents=True)
+        source.write_bytes(payload)
+        record.clients.append(
+            ClientMetadata(
+                id=client_id,
+                index=index,
+                display_name=f"Client {index}",
+                tunnel_ipv4=f"10.8.0.{index + 1}",
+                config_relative_path=relative,
+                private_key_relative_path=f"clients/{client_id}/client.privatekey",
+            )
+        )
+    bridge.orchestrator.deployments.save(record)
+
+    first = bridge.get_client_config_export(record.id, "client-1")
+    second = bridge.get_client_config_export(record.id, "client-2")
+    with pytest.raises(RuntimeError, match="Unknown deployment client"):
+        bridge.get_client_config_export(record.id, "client-3")
+    assert first["filename"] == "heres-vpn-us-east-1-a01784ba-client-1.conf"
+    assert second["filename"] == "heres-vpn-us-east-1-a01784ba-client-2.conf"
+    assert first["path"] == str(desktop / first["filename"])
+    assert second["path"] == str(desktop / second["filename"])
+    assert bridge.save_client_config(record.id, "client-1")["status"] == "success"
+    assert bridge.save_client_config(record.id, "client-2")["status"] == "success"
+    assert chosen == [desktop / first["filename"], desktop / second["filename"]]
+    assert chosen[0].read_bytes() == payloads[0]
+    assert chosen[1].read_bytes() == payloads[1]

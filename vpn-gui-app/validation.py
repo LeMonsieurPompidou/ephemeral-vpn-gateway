@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ipaddress
 
+from client_peers import validate_client_count
 from models import DeploymentOptions
 
 
 def validate_options(options: DeploymentOptions) -> None:
+    validate_client_count(options.client_count)
     if not options.allowed_ips:
         raise ValueError("At least one AllowedIPs CIDR is required")
     for value in options.allowed_ips:

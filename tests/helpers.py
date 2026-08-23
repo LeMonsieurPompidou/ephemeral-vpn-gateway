@@ -87,8 +87,11 @@ def make_orchestrator(
     for provider in orchestrator.providers.list():
         provider.validate_credentials = lambda cancel=None: (True, "ok")  # type: ignore[method-assign]
 
-    def healthy(record, outputs, options, client_private, cancel, *, automatic_ssh_cidr):  # type: ignore[no-untyped-def]
-        Path(record.runtime_directory, "client.conf").write_text("test-config", encoding="utf-8")
+    def healthy(record, outputs, options, client_peers, cancel, *, automatic_ssh_cidr):  # type: ignore[no-untyped-def]
+        for peer in client_peers:
+            path = Path(record.runtime_directory, *peer.config_relative_path.split("/"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"test-config-{peer.id}", encoding="utf-8")
 
     orchestrator._basic_health_checks = healthy  # type: ignore[method-assign]
     return orchestrator

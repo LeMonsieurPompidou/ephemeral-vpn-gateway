@@ -23,6 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 COMMON = ROOT / "terraform-common"
 SERVER_PRIVATE = base64.b64encode(bytes(range(32))).decode("ascii")
 CLIENT_PUBLIC = base64.b64encode(bytes(reversed(range(32)))).decode("ascii")
+CLIENT_PEERS: list[dict[str, object]] = [{"id": "client-1", "public_key": CLIENT_PUBLIC, "tunnel_ipv4": "10.8.0.2"}]
+CLIENT_PUBLIC_2 = base64.b64encode(bytes((value + 1) % 256 for value in reversed(range(32)))).decode("ascii")
 
 
 def rendered(provider_id: str) -> str:
@@ -31,7 +33,7 @@ def rendered(provider_id: str) -> str:
         COMMON,
         wireguard_port=51820,
         server_private_key=SERVER_PRIVATE,
-        client_public_key=CLIENT_PUBLIC,
+        client_peers=CLIENT_PEERS,
     )
 
 
@@ -146,6 +148,46 @@ def test_final_payload_has_literal_shell_expansion_and_complete_wireguard_bootst
     ):
         assert required in payload
     assert payload.index("systemctl is-active --quiet wg-quick@wg0") < payload.index('touch "${READY_MARKER}"')
+
+
+@pytest.mark.parametrize("provider_id", ["aws-lightsail", "digitalocean", "scaleway"])
+def test_final_payload_contains_one_server_peer_block_per_client(provider_id: str) -> None:
+    payload = render_user_data(
+        provider_id,
+        COMMON,
+        wireguard_port=51820,
+        server_private_key=SERVER_PRIVATE,
+        client_peers=[
+            {"id": "client-1", "public_key": CLIENT_PUBLIC, "tunnel_ipv4": "10.8.0.2"},
+            {"id": "client-2", "public_key": CLIENT_PUBLIC_2, "tunnel_ipv4": "10.8.0.3"},
+        ],
+    )
+    bootstrap = bootstrap_from_payload(provider_id, payload)
+    assert bootstrap.count("[Peer]") == 2
+    assert f"PublicKey = {CLIENT_PUBLIC}\nAllowedIPs = 10.8.0.2/32" in bootstrap
+    assert f"PublicKey = {CLIENT_PUBLIC_2}\nAllowedIPs = 10.8.0.3/32" in bootstrap
+
+
+@pytest.mark.parametrize(
+    "peers",
+    [
+        [],
+        [
+            {"id": "client-1", "public_key": CLIENT_PUBLIC, "tunnel_ipv4": "10.8.0.2"},
+            {"id": "client-2", "public_key": CLIENT_PUBLIC, "tunnel_ipv4": "10.8.0.3"},
+        ],
+        [{"id": "client-1", "public_key": CLIENT_PUBLIC, "tunnel_ipv4": "10.8.0.3"}],
+    ],
+)
+def test_render_rejects_missing_duplicate_or_non_deterministic_peers(peers: list[dict[str, object]]) -> None:
+    with pytest.raises(UserDataValidationError):
+        render_user_data(
+            "aws-lightsail",
+            COMMON,
+            wireguard_port=51820,
+            server_private_key=SERVER_PRIVATE,
+            client_peers=peers,
+        )
 
 
 @pytest.mark.parametrize("provider_id", ["aws-lightsail", "digitalocean", "scaleway"])

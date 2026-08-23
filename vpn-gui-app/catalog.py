@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,14 @@ class ProviderCatalog:
             if not re.fullmatch(r"[A-Z]{2}", country_code):
                 raise CatalogError(f"{provider_id}/{location_id} has invalid country code")
             try:
+                hourly_cost = raw.get("estimated_hourly_cost_usd")
+                if hourly_cost is not None and (
+                    isinstance(hourly_cost, bool)
+                    or not isinstance(hourly_cost, (int, float))
+                    or not math.isfinite(hourly_cost)
+                    or hourly_cost < 0
+                ):
+                    raise ValueError("estimated_hourly_cost_usd must be a non-negative finite number")
                 locations.append(
                     Location(
                         id=location_id,
@@ -87,7 +96,7 @@ class ProviderCatalog:
                         capabilities=tuple(capabilities),
                         streaming_status=StreamingStatus(raw["streaming_status"]),
                         description=raw.get("description"),
-                        estimated_hourly_cost_usd=raw.get("estimated_hourly_cost_usd"),
+                        estimated_hourly_cost_usd=float(hourly_cost) if hourly_cost is not None else None,
                     )
                 )
             except (KeyError, ValueError) as exc:

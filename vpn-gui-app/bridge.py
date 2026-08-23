@@ -190,8 +190,11 @@ class BridgeService:
     def get_status(self, deployment_id: str) -> dict[str, object]:
         return self.orchestrator.get_status(deployment_id)
 
-    def get_client_config(self, deployment_id: str) -> str:
-        return self.orchestrator.get_client_config(deployment_id)
+    def get_client_configs(self, deployment_id: str) -> list[dict[str, object]]:
+        return self.orchestrator.list_client_configs(deployment_id)
+
+    def get_client_config(self, deployment_id: str, client_id: str | None = None) -> str:
+        return self.orchestrator.get_client_config(deployment_id, client_id)
 
     def list_recovery_deployments(self) -> list[dict[str, object]]:
         return self.orchestrator.recovery_candidates()
@@ -212,22 +215,33 @@ class BridgeService:
         with self._lock:
             return self._logs.get(deployment_id, [])[-250:]
 
-    def get_client_config_export(self, deployment_id: str) -> dict[str, str]:
+    def get_client_config_export(self, deployment_id: str, client_id: str | None = None) -> dict[str, str]:
         record = self.orchestrator.deployments.get(deployment_id)
-        self.orchestrator.client_config_path(deployment_id)
+        clients = self.orchestrator.list_client_configs(deployment_id)
+        selected_id = client_id or str(clients[0]["id"])
+        if selected_id not in {str(client["id"]) for client in clients}:
+            raise RuntimeError("Unknown deployment client")
+        self.orchestrator.client_config_path(deployment_id, selected_id)
         desktop = resolve_desktop_directory()
-        proposed = proposed_export_path(desktop, record.location_id, record.id)
+        proposed = proposed_export_path(
+            desktop,
+            record.location_id,
+            record.id,
+            selected_id,
+            total_clients=len(clients),
+        )
         return {
             "status": "ready",
             "deployment_id": record.id,
+            "client_id": selected_id,
             "directory": str(desktop),
             "filename": proposed.name,
             "path": str(proposed),
         }
 
-    def save_client_config(self, deployment_id: str) -> dict[str, str]:
-        proposal = self.get_client_config_export(deployment_id)
-        source = self.orchestrator.client_config_path(deployment_id)
+    def save_client_config(self, deployment_id: str, client_id: str | None = None) -> dict[str, str]:
+        proposal = self.get_client_config_export(deployment_id, client_id)
+        source = self.orchestrator.client_config_path(deployment_id, proposal["client_id"])
         selected = self._save_dialog(Path(proposal["directory"]), proposal["filename"])
         if selected is None:
             return {"status": "cancelled", "path": proposal["path"]}

@@ -86,16 +86,37 @@ def _slug(value: str, *, fallback: str, maximum: int = 48) -> str:
     return normalized[:maximum].rstrip("-") or fallback
 
 
-def default_config_filename(location_id: str, deployment_id: str) -> str:
+def default_config_filename(
+    location_id: str,
+    deployment_id: str,
+    client_id: str | None = None,
+    *,
+    total_clients: int = 1,
+) -> str:
     location = _slug(location_id, fallback="location")
     short_id = _slug(deployment_id, fallback="deployment", maximum=8)
-    return f"heres-vpn-{location}-{short_id}.conf"
+    client_suffix = ""
+    if total_clients > 1:
+        client_suffix = f"-{_slug(client_id or 'client', fallback='client', maximum=24)}"
+    return f"heres-vpn-{location}-{short_id}{client_suffix}.conf"
 
 
-def proposed_export_path(desktop: Path, location_id: str, deployment_id: str) -> Path:
+def proposed_export_path(
+    desktop: Path,
+    location_id: str,
+    deployment_id: str,
+    client_id: str | None = None,
+    *,
+    total_clients: int = 1,
+) -> Path:
     if not desktop.is_absolute():
         raise ConfigExportError("Desktop directory must be absolute")
-    return desktop / default_config_filename(location_id, deployment_id)
+    return desktop / default_config_filename(
+        location_id,
+        deployment_id,
+        client_id,
+        total_clients=total_clients,
+    )
 
 
 def normalize_export_destination(value: str | Path) -> Path:

@@ -1,11 +1,13 @@
 locals {
-  vpn_name         = "ephemeral-vpn-do-${substr(var.deployment_id, 0, 8)}"
-  bootstrap_source = file("${path.module}/../terraform-common/bootstrap.sh.tftpl")
+  vpn_name               = "ephemeral-vpn-do-${substr(var.deployment_id, 0, 8)}"
+  bootstrap_source       = file("${path.module}/../terraform-common/bootstrap.sh.tftpl")
+  effective_client_peers = length(var.client_peers) > 0 ? var.client_peers : (var.client_public_key == null ? [] : [{ id = "client-1", public_key = var.client_public_key, tunnel_ipv4 = "10.8.0.2" }])
+  client_peer_config     = join("\n\n", [for peer in local.effective_client_peers : "[Peer]\nPublicKey = ${peer.public_key}\nAllowedIPs = ${peer.tunnel_ipv4}/32"])
   bootstrap_script = replace(replace(replace(replace(
     local.bootstrap_source,
     "@@WIREGUARD_PORT@@", tostring(var.wireguard_port)),
     "@@SERVER_PRIVATE_KEY@@", var.server_private_key),
-    "@@CLIENT_PUBLIC_KEY@@", var.client_public_key),
+    "@@CLIENT_PEERS@@", local.client_peer_config),
   "@@BOOTSTRAP_FINGERPRINT@@", substr(sha256(local.bootstrap_source), 0, 12))
   cloud_init = replace(
     file("${path.module}/../terraform-common/cloud-init.yaml.tftpl"),
@@ -38,6 +40,10 @@ resource "digitalocean_droplet" "vpn" {
     precondition {
       condition     = var.ssh_public_key != null || var.ssh_key_name != null
       error_message = "Provide ssh_public_key or ssh_key_name."
+    }
+    precondition {
+      condition     = length(local.effective_client_peers) >= 1 && length(local.effective_client_peers) <= 10
+      error_message = "Provide between 1 and 10 WireGuard client peers."
     }
   }
 }

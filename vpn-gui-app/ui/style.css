@@ -376,6 +376,35 @@ body::before {
     align-items: stretch;
 }
 
+.client-config-shell {
+    display: grid;
+    gap: 16px;
+    width: min(100%, 760px);
+}
+
+.client-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.client-tab {
+    padding: 7px 11px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: white;
+    color: var(--text);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 650;
+}
+
+.client-tab.active {
+    border-color: var(--primary);
+    background: var(--primary-soft);
+    color: var(--primary);
+}
+
 .config-options {
     display: grid;
     grid-template-columns: minmax(200px, auto) minmax(280px, 1fr);
