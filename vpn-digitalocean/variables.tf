@@ -74,6 +74,10 @@ variable "deployment_id" {
   description = "Application deployment UUID used for ownership and unique names"
   type        = string
   default     = "manual"
+  validation {
+    condition     = length(var.deployment_id) <= 244 && can(regex("^[a-z0-9_-]+$", var.deployment_id))
+    error_message = "deployment_id must contain only lowercase letters, digits, dashes, or underscores and fit in a DigitalOcean tag."
+  }
 }
 variable "expires_at" {
   description = "Best-effort local expiration timestamp; no cloud-side reaper is implied"

@@ -1,5 +1,6 @@
 locals {
   vpn_name               = "ephemeral-vpn-do-${substr(var.deployment_id, 0, 8)}"
+  digitalocean_tags      = ["wireguard", "ephemeral-vpn", "deployment:${var.deployment_id}"]
   bootstrap_source       = file("${path.module}/../terraform-common/bootstrap.sh.tftpl")
   effective_client_peers = length(var.client_peers) > 0 ? var.client_peers : (var.client_public_key == null ? [] : [{ id = "client-1", public_key = var.client_public_key, tunnel_ipv4 = "10.8.0.2" }])
   client_peer_config     = join("\n\n", [for peer in local.effective_client_peers : "[Peer]\nPublicKey = ${peer.public_key}\nAllowedIPs = ${peer.tunnel_ipv4}/32"])
@@ -35,7 +36,7 @@ resource "digitalocean_droplet" "vpn" {
   region    = var.region
   ssh_keys  = var.ssh_public_key == null ? [data.digitalocean_ssh_key.existing[0].id] : [digitalocean_ssh_key.vpn[0].id]
   user_data = local.user_data
-  tags      = compact(["wireguard", "ephemeral-vpn", "deployment:${var.deployment_id}", var.expires_at == null ? "" : "expires-at:${var.expires_at}"])
+  tags      = local.digitalocean_tags
   lifecycle {
     precondition {
       condition     = var.ssh_public_key != null || var.ssh_key_name != null
@@ -44,6 +45,10 @@ resource "digitalocean_droplet" "vpn" {
     precondition {
       condition     = length(local.effective_client_peers) >= 1 && length(local.effective_client_peers) <= 10
       error_message = "Provide between 1 and 10 WireGuard client peers."
+    }
+    precondition {
+      condition     = alltrue([for tag in local.digitalocean_tags : length(tag) <= 255 && can(regex("^[a-z0-9:_-]+$", tag))])
+      error_message = "DigitalOcean tags must contain only lowercase letters, digits, colons, dashes, or underscores and be at most 255 characters."
     }
   }
 }

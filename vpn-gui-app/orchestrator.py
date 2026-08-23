@@ -450,7 +450,7 @@ class Orchestrator:
         except Exception as exc:
             record.state_present = Path(record.state_path).is_file()
             record.cleanup_status = "required" if record.resources_possible else "not_required"
-            message = redact(str(exc))
+            message = self._deployment_failure_message(provider_id, exc, record.resources_possible)
             self._transition(record, DeploymentState.FAILED, message, error=message)
             return {"status": "error", "deployment_id": identifier, "state": record.state.value, "message": message}
 
@@ -2373,6 +2373,16 @@ class Orchestrator:
     def _raise_if_cancelled(cancel: threading.Event) -> None:
         if cancel.is_set():
             raise TerraformCancelled("Deployment operation cancelled")
+
+    @staticmethod
+    def _deployment_failure_message(provider_id: str, error: Exception, resources_possible: bool) -> str:
+        detail = redact(str(error))
+        if provider_id == "digitalocean" and "tags may contain lowercase letters" in detail.lower():
+            message = "DigitalOcean rejected the generated resource metadata."
+            if resources_possible:
+                message += " Cloud resources may exist and must be destroyed."
+            return message
+        return detail
 
     @staticmethod
     def _run_cancellable_process(args: list[str], cancel: threading.Event, *, timeout: float) -> tuple[int, str, str]:
