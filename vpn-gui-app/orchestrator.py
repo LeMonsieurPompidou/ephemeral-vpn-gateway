@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterator
 
+from app_settings import SettingsStore
 from catalog import ProviderCatalog
 from client_peers import (
     CLIENT_SCHEMA_VERSION,
@@ -27,6 +28,15 @@ from client_peers import (
 )
 from cloud_init import FAILURE_MARKER, READINESS_MARKER, bootstrap_source_sha256, render_user_data
 from config_export import ConfigExportError, regular_file_sha256, remove_tracked_config
+from credential_preflight import CredentialCheck, digitalocean_check, scaleway_check
+from credential_resolver import CredentialResolver
+from credential_store import (
+    DIGITALOCEAN_TOKEN_TARGET,
+    SCALEWAY_ACCESS_KEY_TARGET,
+    SCALEWAY_SECRET_KEY_TARGET,
+    CredentialStore,
+    UnavailableCredentialStore,
+)
 from file_lock import FileLock
 from legacy_cloud_verification import LegacyCloudVerifier
 from legacy_reconciliation import LegacyReconciliationStore, LegacySourceStore
@@ -135,12 +145,27 @@ class Orchestrator:
         cloud_init_inactivity_timeout: float = CLOUD_INIT_INACTIVITY_TIMEOUT_SECONDS,
         wireguard_readiness_timeout: float = WIREGUARD_READINESS_TIMEOUT_SECONDS,
         readiness_poll_interval: float = READINESS_POLL_INTERVAL_SECONDS,
+        credential_store: CredentialStore | None = None,
+        packaged: bool | None = None,
     ) -> None:
         self.resource_root = resource_root.resolve()
         self.runtime_root = runtime_root.resolve()
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.catalog = ProviderCatalog(self.resource_root / "vpn-gui-app" / "provider_catalog.json")
-        self.providers = ProviderRegistry(self.catalog)
+        self.settings = SettingsStore(self.runtime_root / "settings.json")
+        self.credential_store = credential_store or UnavailableCredentialStore()
+        provider_roots = {
+            provider.id: self.resource_root / str(provider.terraform_root)
+            for provider in self.catalog.list_providers()
+            if provider.terraform_root
+        }
+        self.credential_resolver = CredentialResolver(
+            self.credential_store,
+            self.settings,
+            provider_roots,
+            packaged=packaged,
+        )
+        self.providers = ProviderRegistry(self.catalog, self.credential_resolver)
         self.deployments = DeploymentRegistry(self.runtime_root / "deployments.json")
         self.legacy_reconciliations = LegacyReconciliationStore(self.runtime_root / "legacy-reconciliations")
         self.legacy_verifications = LegacyReconciliationStore(self.runtime_root / "legacy-verifications")
@@ -186,6 +211,142 @@ class Orchestrator:
     def validate_credentials(self, provider_id: str) -> dict[str, object]:
         result = self.providers.get(provider_id).credential_details()
         return {"provider_id": provider_id, **result.to_dict()}
+
+    def credential_status(self, provider_id: str) -> dict[str, object]:
+        self.providers.get(provider_id)
+        resolved = self.credential_resolver.resolve(provider_id)
+        result: dict[str, object] = {
+            "provider_id": provider_id,
+            "configured": resolved.configured,
+            "source": resolved.source,
+        }
+        settings = self.settings.load()
+        if provider_id == "aws-lightsail":
+            result["profile"] = resolved.values.get("profile") or settings.aws_profile
+        elif provider_id == "scaleway":
+            result["project_id"] = settings.scaleway_project_id
+        return result
+
+    def save_provider_credentials(self, provider_id: str, values: dict[str, object]) -> dict[str, object]:
+        self.providers.get(provider_id)
+        if provider_id == "digitalocean":
+            token = self._required_credential_text(values, "token", max_length=2560)
+            check = digitalocean_check(token)
+            if not check.valid:
+                return {"provider_id": provider_id, **check.to_dict(), "saved": False}
+            self.credential_store.save(DIGITALOCEAN_TOKEN_TARGET, token)
+        elif provider_id == "scaleway":
+            access_key = self._required_credential_text(values, "access_key", max_length=512)
+            secret_key = self._required_credential_text(values, "secret_key", max_length=2560)
+            project_id = self._required_credential_text(values, "project_id", max_length=64)
+            try:
+                uuid.UUID(project_id)
+            except ValueError:
+                return {
+                    "provider_id": provider_id,
+                    **CredentialCheck(False, "invalid", "Project ID must be a valid UUID.").to_dict(),
+                    "saved": False,
+                }
+            check = scaleway_check(secret_key, project_id)
+            if not check.valid:
+                return {"provider_id": provider_id, **check.to_dict(), "saved": False}
+            previous_access = self.credential_store.get(SCALEWAY_ACCESS_KEY_TARGET)
+            previous_secret = self.credential_store.get(SCALEWAY_SECRET_KEY_TARGET)
+            previous_settings = self.settings.load()
+            try:
+                self.credential_store.save(SCALEWAY_ACCESS_KEY_TARGET, access_key)
+                self.credential_store.save(SCALEWAY_SECRET_KEY_TARGET, secret_key)
+                self.settings.update(scaleway_project_id=project_id)
+            except Exception:
+                self._restore_secret(SCALEWAY_ACCESS_KEY_TARGET, previous_access)
+                self._restore_secret(SCALEWAY_SECRET_KEY_TARGET, previous_secret)
+                self.settings.save(previous_settings)
+                raise
+        elif provider_id == "aws-lightsail":
+            profile = self._required_credential_text(values, "profile", max_length=128)
+            if not re.fullmatch(r"[A-Za-z0-9_+=,.@-]+", profile):
+                raise ValueError("AWS profile contains unsupported characters")
+            self.settings.update(aws_profile=profile)
+            return {"provider_id": provider_id, "saved": True, "configured": True, "profile": profile}
+        else:
+            raise ValueError("Unsupported provider")
+        return {
+            "provider_id": provider_id,
+            "saved": True,
+            "configured": True,
+            "source": "windows_credential_manager",
+            "message": f"{self.catalog.get_provider(provider_id).display_name} credentials are configured.",
+        }
+
+    def remove_provider_credentials(self, provider_id: str, confirmed_active: bool = False) -> dict[str, object]:
+        self.providers.get(provider_id)
+        active = [
+            record.id
+            for record in self.deployments.list()
+            if record.provider_id == provider_id
+            and record.state != DeploymentState.DESTROYED
+            and record.resources_possible
+        ]
+        if active and not confirmed_active:
+            return {
+                "provider_id": provider_id,
+                "removed": False,
+                "requires_confirmation": True,
+                "message": "These credentials may be required to destroy the active gateway.",
+            }
+        if provider_id == "digitalocean":
+            self.credential_store.delete(DIGITALOCEAN_TOKEN_TARGET)
+        elif provider_id == "scaleway":
+            self.credential_store.delete(SCALEWAY_ACCESS_KEY_TARGET)
+            self.credential_store.delete(SCALEWAY_SECRET_KEY_TARGET)
+            self.settings.update(scaleway_project_id=None)
+        elif provider_id == "aws-lightsail":
+            self.settings.update(aws_profile=None)
+        return {"provider_id": provider_id, "removed": True, "requires_confirmation": False}
+
+    def login_aws(self) -> dict[str, object]:
+        resolved = self.credential_resolver.resolve("aws-lightsail")
+        profile = resolved.values.get("profile", "")
+        if not profile:
+            raise ValueError("Configure an AWS profile before signing in")
+        executable = shutil.which("aws")
+        if not executable and sys.platform.startswith("win"):
+            candidate = Path(r"C:\Program Files\Amazon\AWSCLIV2\aws.exe")
+            executable = str(candidate) if candidate.is_file() else None
+        if not executable:
+            raise ValueError("AWS CLI v2 was not found")
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
+        try:
+            result = subprocess.run(
+                [executable, "sso", "login", "--profile", profile, "--no-cli-pager"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+                creationflags=creationflags,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValueError("AWS sign-in did not complete. Retry from the credential panel.") from exc
+        if result.returncode != 0:
+            raise ValueError("AWS sign-in failed. Verify the profile and retry.")
+        return {"provider_id": "aws-lightsail", "signed_in": True, "message": "AWS sign-in completed."}
+
+    @staticmethod
+    def _required_credential_text(values: dict[str, object], name: str, *, max_length: int) -> str:
+        value = values.get(name)
+        if not isinstance(value, str) or not value.strip() or "\x00" in value or len(value) > max_length:
+            raise ValueError(f"{name.replace('_', ' ').title()} is missing or invalid")
+        return value.strip()
+
+    def _restore_secret(self, target: str, value: str | None) -> None:
+        if value is None:
+            self.credential_store.delete(target)
+        else:
+            self.credential_store.save(target, value)
 
     def initialize(self, provider_id: str, deployment_id: str | None = None) -> dict[str, object]:
         provider = self.providers.get(provider_id)
@@ -348,7 +509,7 @@ class Orchestrator:
             self.deployments.save(record)
             self._raise_if_cancelled(cancel)
 
-            self._stage_terraform_configuration(record, include_legacy_tfvars=True)
+            self._stage_terraform_configuration(record, include_legacy_tfvars=self._uses_legacy_tfvars(provider_id))
             env = self._terraform_env(record)
             with self._provider_operation_lock(provider_id, terraform_directory):
                 self._transition(
@@ -1067,7 +1228,10 @@ class Orchestrator:
             directory = Path(record.terraform_directory)
             with self._provider_operation_lock(record.provider_id, directory):
                 self._validate_recovery_backend(record, env)
-                self._stage_terraform_configuration(record, include_legacy_tfvars=True)
+                self._stage_terraform_configuration(
+                    record,
+                    include_legacy_tfvars=self._uses_legacy_tfvars(record.provider_id),
+                )
                 self._initialize_terraform_backend(record, env=env, cancel=cancel, fresh=False)
                 self._run_terraform(
                     record,
@@ -2258,7 +2422,12 @@ class Orchestrator:
 
     def _terraform_env(self, record: DeploymentRecord) -> dict[str, str]:
         runtime = Path(record.runtime_directory)
-        return {"TF_DATA_DIR": str(runtime / ".terraform"), "TF_IN_AUTOMATION": "1"}
+        result = {"TF_DATA_DIR": str(runtime / ".terraform"), "TF_IN_AUTOMATION": "1"}
+        result.update(self.credential_resolver.resolve(record.provider_id).terraform_environment())
+        return result
+
+    def _uses_legacy_tfvars(self, provider_id: str) -> bool:
+        return self.credential_resolver.resolve(provider_id).source == "terraform_tfvars"
 
     def _run_terraform(
         self,

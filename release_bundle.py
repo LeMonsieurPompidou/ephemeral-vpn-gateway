@@ -9,12 +9,15 @@ from typing import Iterable
 
 LOCAL_PYTHON_FILES = (
     "vpn-gui-app/app.py",
+    "vpn-gui-app/app_settings.py",
     "vpn-gui-app/bridge.py",
     "vpn-gui-app/catalog.py",
     "vpn-gui-app/client_peers.py",
     "vpn-gui-app/cloud_init.py",
     "vpn-gui-app/config_export.py",
     "vpn-gui-app/credential_preflight.py",
+    "vpn-gui-app/credential_resolver.py",
+    "vpn-gui-app/credential_store.py",
     "vpn-gui-app/file_lock.py",
     "vpn-gui-app/legacy_cloud_verification.py",
     "vpn-gui-app/legacy_reconciliation.py",

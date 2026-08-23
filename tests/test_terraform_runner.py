@@ -44,6 +44,18 @@ def test_timeout(tmp_path: Path) -> None:
         runner.run(["-c", "import time; time.sleep(2)"], tmp_path)
 
 
+def test_runner_redacts_resolved_provider_secrets_from_output(tmp_path: Path) -> None:
+    secret = "provider-secret-value"
+    runner = TerraformRunner(executable=sys.executable)
+    result = runner.run(
+        ["-c", "import os; print(os.environ['TF_VAR_do_token'])"],
+        tmp_path,
+        env={"TF_VAR_do_token": secret},
+    )
+    assert secret not in result.stdout
+    assert "[REDACTED]" in result.stdout
+
+
 def test_cancellation(tmp_path: Path) -> None:
     cancel = threading.Event()
     cancel.set()

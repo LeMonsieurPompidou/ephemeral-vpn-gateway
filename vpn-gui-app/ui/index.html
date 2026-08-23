@@ -19,6 +19,7 @@
     </div>
     <div class="badges"><span id="server-type" class="badge">cloud</span><span id="streaming" class="badge muted">unverified</span><span id="cost" class="badge muted">Estimated cost unavailable</span></div>
     <p class="muted-text">Lifetime cleanup is local and best-effort. It cannot run while this computer is off, the app is closed, or cloud credentials are unavailable.</p>
+    <div class="credential-setup-row"><span><strong>Credentials</strong><span id="credential-status" class="credential-status">Checking...</span></span><button id="manage-credentials" class="btn btn-compact" type="button">Configure</button></div>
     <div id="credential-feedback" class="credential-feedback hidden" role="status"><strong id="credential-message"></strong><details id="credential-help" class="hidden"><summary>Credential setup</summary><div id="credential-help-content"></div></details></div>
   </section>
   <aside id="legacy-warning" class="compact-warning hidden" role="alert"><span>Deployment recovery is required before creating a new gateway.</span><button id="open-recovery" class="link-btn">Open recovery</button></aside>
@@ -55,5 +56,24 @@
     </div>
     <details><summary>Live non-sensitive logs</summary><pre id="logs" class="logs"></pre></details>
   </section>
+  <dialog id="credential-dialog" class="credential-dialog">
+    <form id="credential-form" method="dialog" autocomplete="off">
+      <div class="dialog-header"><div><h2 id="credential-dialog-title">Provider credentials</h2><p id="credential-dialog-note" class="muted-text"></p></div><button id="credential-close" class="link-btn" type="button" aria-label="Close">Close</button></div>
+      <div id="credential-digitalocean" class="credential-fields hidden">
+        <label><span>API token</span><input id="do-token" type="password" autocomplete="new-password" spellcheck="false"></label>
+      </div>
+      <div id="credential-scaleway" class="credential-fields hidden">
+        <label><span>Access key</span><input id="scw-access-key" type="password" autocomplete="new-password" spellcheck="false"></label>
+        <label><span>Secret key</span><input id="scw-secret-key" type="password" autocomplete="new-password" spellcheck="false"></label>
+        <label><span>Project ID</span><input id="scw-project-id" type="text" autocomplete="off" spellcheck="false"></label>
+      </div>
+      <div id="credential-aws" class="credential-fields hidden">
+        <label><span>AWS profile</span><input id="aws-profile" type="text" autocomplete="off" spellcheck="false" placeholder="heres-vpn"></label>
+        <p class="muted-text">AWS CLI v2 and IAM Identity Center manage authentication. H&eacute;r&egrave;s stores only the profile name.</p>
+      </div>
+      <p id="credential-dialog-result" class="dialog-result" role="status"></p>
+      <div class="dialog-actions"><button id="credential-save" class="btn btn-primary" type="button">Save and check</button><button id="aws-login" class="btn hidden" type="button">Login with AWS</button><button id="credential-remove" class="btn btn-destructive" type="button">Remove saved credentials</button><button id="credential-cancel" class="btn" type="button">Cancel</button></div>
+    </form>
+  </dialog>
 </main>
 </body></html>

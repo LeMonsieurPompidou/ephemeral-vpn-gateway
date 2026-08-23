@@ -121,9 +121,15 @@ Hérès stores deployment runtimes under `%LOCALAPPDATA%\EphemeralVpnGateway` by
 
 Use placeholders in local configuration and never commit real credentials. **Check credentials** follows the same credential source that the provider will use during deployment.
 
+### Packaged Windows application
+
+Select a provider and use **Configure credentials**. DigitalOcean and Scaleway secrets are stored as per-user generic credentials in Windows Credential Manager; they are not written to `settings.json`, the deployment registry, Terraform source, or the executable. Scaleway's project ID and the selected AWS profile name are non-secret preferences stored in `%LOCALAPPDATA%\EphemeralVpnGateway\settings.json`.
+
+Packaged credential precedence is: inherited provider environment variables, then Windows Credential Manager/non-secret Hérès settings, then missing. This lets the executable work when opened directly from Explorer while retaining environment overrides for advanced use.
+
 ### AWS Lightsail
 
-Hérès expects an AWS CLI v2 profile through `AWS_PROFILE`. A generic IAM Identity Center setup is:
+AWS authentication remains owned by AWS CLI v2 and IAM Identity Center. Save a profile name in **Configure credentials**, then use **Login with AWS** and **Check credentials**. Hérès never stores AWS SSO tokens or passwords. The equivalent advanced/source setup is:
 
 ```powershell
 aws configure sso --profile heres-vpn
@@ -133,11 +139,13 @@ $env:AWS_PROFILE = "heres-vpn"
 .\.venv\Scripts\python.exe .\vpn-gui-app\app.py
 ```
 
-The credential check runs a bounded, non-interactive `aws sts get-caller-identity` for the selected profile. Identity output and account details are not logged. If the SSO session expires, log in again and retry **Check credentials**.
+The credential check runs a bounded, non-interactive `aws sts get-caller-identity` for the selected profile. Identity output and account details are not logged. `AWS_PROFILE` overrides the saved profile for that process. If the SSO session expires, use **Login with AWS** again.
 
 ### DigitalOcean
 
-The known-good, Git-ignored provider tfvars contract remains supported. Create `vpn-digitalocean/terraform.tfvars`:
+For the packaged application, enter the API token through **Configure credentials**. A bounded read-only account check must succeed before the token is saved to Windows Credential Manager.
+
+Source/development mode retains the known-good, Git-ignored provider tfvars contract. Create `vpn-digitalocean/terraform.tfvars`:
 
 ```hcl
 do_token     = "<digitalocean-token>"
@@ -146,7 +154,7 @@ ssh_key_name = "<existing-key-name>"
 
 `do_token` is the credential input. `ssh_key_name` is retained for historical/manual compatibility; desktop deployments normally register their generated per-deployment SSH public key.
 
-Environment authentication is also supported:
+Environment authentication is also supported and takes precedence:
 
 ```powershell
 $env:DIGITALOCEAN_TOKEN = "<digitalocean-token>"
@@ -157,7 +165,9 @@ $env:DIGITALOCEAN_TOKEN = "<digitalocean-token>"
 
 ### Scaleway
 
-The known-good, Git-ignored tfvars contract is:
+For the packaged application, **Configure credentials** stores the access and secret keys in Windows Credential Manager and the non-secret project ID in Hérès settings. A bounded read-only project check must succeed before they are persisted.
+
+Source/development mode retains the known-good, Git-ignored tfvars contract:
 
 ```hcl
 scaleway_access_key = "<access-key>"
@@ -165,7 +175,7 @@ scaleway_secret_key = "<secret-key>"
 scaleway_project_id = "<project-id>"
 ```
 
-Place these values in `vpn-scaleway/terraform.tfvars`, or use environment variables:
+Place these values in `vpn-scaleway/terraform.tfvars`, or use environment variables, which take precedence:
 
 ```powershell
 $env:SCW_ACCESS_KEY = "<access-key>"
@@ -179,10 +189,11 @@ The selected catalog location supplies the Scaleway zone and region, so `SCW_DEF
 
 ### Credential handling notes
 
-- Provider `terraform.tfvars` files are ignored by Git and are copied into the protected deployment runtime only when Terraform needs them.
-- Hérès does not intentionally store provider credentials in `deployments.json`, application logs, Live non-sensitive logs, or browser storage.
-- PowerShell `$env:...` assignments are session-local and inherited only by child processes. Launch Hérès from the same terminal.
-- An `.exe` opened independently from Explorer will not inherit temporary variables from an unrelated PowerShell session.
+- Provider `terraform.tfvars` files are source-mode compatibility inputs. They are ignored by Git and copied into the protected deployment runtime only when that exact source is selected.
+- Environment variables override saved credentials. PowerShell `$env:...` assignments are session-local and inherited only by child processes.
+- A packaged `.exe` opened from Explorer can use saved Windows credentials without a PowerShell session.
+- Hérès does not intentionally store provider secrets in `settings.json`, `deployments.json`, application logs, Live non-sensitive logs, browser storage, or generated auto tfvars.
+- **Remove saved credentials** removes only Hérès entries. If an active gateway may exist, the UI warns that credentials may be needed for Destroy.
 - Do not commit credentials, paste them into issues, or include them in screenshots.
 
 ## Usage
@@ -359,7 +370,7 @@ The PyInstaller spec uses an audited file-by-file data allowlist. It deliberatel
 .\.venv\Scripts\python.exe .\release_bundle.py
 ```
 
-Build from a clean working tree and inspect the resulting archive as normal release hygiene. DigitalOcean and Scaleway tfvars remain supported when running from source, but are never bundled; packaged users should launch Hérès with the documented provider environment variables.
+Build from a clean working tree and inspect the resulting archive as normal release hygiene. DigitalOcean and Scaleway tfvars remain supported when running from source, but are never bundled. Packaged users configure credentials through Hérès and Windows Credential Manager; environment variables remain optional overrides.
 
 ## Development
 

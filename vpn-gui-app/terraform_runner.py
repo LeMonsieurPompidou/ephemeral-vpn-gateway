@@ -76,7 +76,16 @@ class TerraformRunner:
         def consume(stream: object, target: list[str]) -> None:
             assert hasattr(stream, "readline")
             for line in iter(stream.readline, ""):  # type: ignore[attr-defined]
-                safe = redact(line.rstrip())
+                safe = line.rstrip()
+                for name in (
+                    "TF_VAR_do_token",
+                    "TF_VAR_scaleway_access_key",
+                    "TF_VAR_scaleway_secret_key",
+                ):
+                    secret = merged_env.get(name)
+                    if secret:
+                        safe = safe.replace(secret, "[REDACTED]")
+                safe = redact(safe)
                 target.append(safe + "\n")
                 if progress and safe:
                     progress(safe)

@@ -477,6 +477,21 @@ select, input { width: 100%; padding: 11px 12px; border: 1px solid var(--border)
 .credential-feedback details { margin-top: 8px; }
 .credential-help-content { display: grid; gap: 5px; margin-top: 8px; }
 .credential-command { display: block; overflow-wrap: anywhere; user-select: text; }
+.credential-setup-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 11px; background: #f8fafc; font-size: 13px; }
+.credential-setup-row > span { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.credential-status { color: var(--muted); overflow-wrap: anywhere; }
+.credential-status.configured { color: #047857; }
+.btn-compact { padding: 7px 11px; min-height: 34px; }
+.credential-dialog { width: min(520px, calc(100vw - 32px)); margin: auto; padding: 0; border: 1px solid var(--border); border-radius: 16px; color: var(--text); box-shadow: var(--shadow); }
+.credential-dialog::backdrop { background: rgba(15, 23, 42, 0.48); }
+.credential-dialog form { display: grid; gap: 16px; padding: 22px; }
+.dialog-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.dialog-header h2 { font-size: 18px; }
+.credential-fields { display: grid; gap: 13px; }
+.dialog-actions { display: flex; flex-wrap: wrap; gap: 9px; }
+.dialog-result { min-height: 22px; color: var(--muted); font-size: 13px; }
+.dialog-result.invalid { color: var(--danger); }
+.dialog-result.valid { color: #047857; }
 .cleanup-warning { padding: 10px 12px; margin: 12px 0; border: 1px solid #fdba74; border-radius: 10px; background: #fff7ed; color: #9a3412; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .status-indicator.ready { background: var(--success); }.status-indicator.failed,.status-indicator.cancelled { background: var(--danger); }
 

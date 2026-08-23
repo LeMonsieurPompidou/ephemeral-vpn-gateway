@@ -32,7 +32,7 @@ def ready_bridge(
         tmp_path / "runtime",
         start_expiration_monitor=False,
         acquire_app_lock=False,
-        **({"save_dialog": save_dialog} if save_dialog else {}),
+        save_dialog=save_dialog or native_save_dialog,
     )
     deployment_id = "a01784ba-a00f-4a53-8f98-557e69bee8f2"
     record = add_record(bridge.orchestrator, "aws-lightsail", deployment_id)

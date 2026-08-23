@@ -11,7 +11,7 @@ function selectedProvider(){ return providers.find((p) => p.id === $('provider')
 function selectedLocation(){ return locations.find((l) => l.id === $('location').value); }
 function option(el, value, label){ const node=document.createElement('option'); node.value=value; node.textContent=label; el.append(node); }
 function updateActionButtons(){const state=currentRecord?.state||'idle';const cloudPossible=Boolean(currentRecord?.resources_possible||currentRecord?.apply_started_at);const terminal=['failed','cancelled','ready'].includes(state);$('destroy').disabled=uiBusy||!deploymentId||!cloudPossible||state==='destroyed'||state==='destroying';$('remove-local').disabled=uiBusy||!deploymentId||cloudPossible||!terminal;}
-function setBusy(busy){ uiBusy=busy; $('deploy').disabled=busy || providerBlocked(); $('validate-credentials').disabled=busy; $('cancel').disabled=!busy || !deploymentId; $('provider').disabled=busy; $('country').disabled=busy; $('location').disabled=busy; $('expiration').disabled=busy; $('client-count').disabled=busy; updateActionButtons(); }
+function setBusy(busy){ uiBusy=busy; $('deploy').disabled=busy || providerBlocked(); $('validate-credentials').disabled=busy; $('manage-credentials').disabled=busy; $('cancel').disabled=!busy || !deploymentId; $('provider').disabled=busy; $('country').disabled=busy; $('location').disabled=busy; $('expiration').disabled=busy; $('client-count').disabled=busy; updateActionButtons(); }
 function stateLabel(value){ return String(value).replaceAll('_',' ').replace(/^./,(c)=>c.toUpperCase()); }
 function renderSteps(state){ $('steps').replaceChildren(...STATES.map((value)=>{ const li=document.createElement('li'); li.textContent=stateLabel(value); const index=STATES.indexOf(state); li.className=STATES.indexOf(value)<index?'done':value===state?'active':''; return li; })); }
 function selectedLegacyBlockers(){return RecoveryState.blockingLegacyStatesForProvider(legacyStates,$('provider').value);}
@@ -216,6 +216,52 @@ function updateSessionEstimate(){
   $('estimated-cost').textContent=SessionCost.formatCost(estimate.costUsd);
 }
 function startTimer(){clearInterval(timer);timer=setInterval(updateSessionEstimate,1000);updateSessionEstimate();}
+function clearCredentialInputs(){for(const id of ['do-token','scw-access-key','scw-secret-key'])$(id).value='';}
+async function refreshCredentialStatus(){
+  const providerId=$('provider').value;if(!providerId)return;
+  const result=await api().credential_status(providerId);if(providerId!==$('provider').value)return;
+  const status=$('credential-status');status.classList.toggle('configured',Boolean(result.configured));
+  if(providerId==='aws-lightsail')status.textContent=result.profile?`Profile: ${result.profile}`:'Not configured';
+  else status.textContent=result.configured?'Configured':'Not configured';
+  $('manage-credentials').textContent=result.configured?'Manage':'Configure';
+}
+function closeCredentialDialog(){clearCredentialInputs();$('credential-dialog-result').textContent='';$('credential-dialog-result').className='dialog-result';$('credential-dialog').close();}
+async function openCredentialDialog(){
+  const providerId=$('provider').value;const provider=selectedProvider();const status=await api().credential_status(providerId);
+  $('credential-dialog-title').textContent=`${provider?.display_name||providerId} credentials`;
+  $('credential-dialog-note').textContent=status.configured?'Credentials are saved. Enter new values only to replace them.':'Configure credentials for this provider.';
+  for(const id of ['credential-digitalocean','credential-scaleway','credential-aws'])$(id).classList.add('hidden');
+  $(`credential-${providerId==='aws-lightsail'?'aws':providerId}`).classList.remove('hidden');
+  $('credential-save').textContent=providerId==='aws-lightsail'?'Save profile':'Save and check';
+  $('aws-login').classList.toggle('hidden',providerId!=='aws-lightsail');
+  $('credential-remove').classList.toggle('hidden',!['windows_credential_manager','settings'].includes(status.source));
+  $('aws-profile').value=status.profile||'';$('scw-project-id').value=status.project_id||'';
+  clearCredentialInputs();$('credential-dialog').showModal();
+}
+async function saveCredentials(){
+  const providerId=$('provider').value;let values;
+  if(providerId==='digitalocean')values={token:$('do-token').value};
+  else if(providerId==='scaleway')values={access_key:$('scw-access-key').value,secret_key:$('scw-secret-key').value,project_id:$('scw-project-id').value};
+  else values={profile:$('aws-profile').value};
+  $('credential-save').disabled=true;$('credential-dialog-result').textContent=providerId==='aws-lightsail'?'Saving profile...':'Validating securely...';
+  try{
+    const result=await api().save_provider_credentials(providerId,values);clearCredentialInputs();
+    $('credential-dialog-result').className=`dialog-result ${result.saved?'valid':'invalid'}`;$('credential-dialog-result').textContent=result.message||(result.saved?'Credentials saved.':'Credentials were not saved.');
+    if(result.saved){await refreshCredentialStatus();$('credential-remove').classList.remove('hidden');}
+  }catch(error){clearCredentialInputs();$('credential-dialog-result').className='dialog-result invalid';$('credential-dialog-result').textContent=error.message||'Credentials were not saved.';}
+  finally{$('credential-save').disabled=false;}
+}
+async function removeCredentials(confirmed=false){
+  const providerId=$('provider').value;const result=await api().remove_provider_credentials(providerId,confirmed);
+  if(result.requires_confirmation){if(confirm(result.message))return removeCredentials(true);return;}
+  clearCredentialInputs();await refreshCredentialStatus();closeCredentialDialog();clearCredentialFeedback();
+}
+async function loginAws(){
+  $('aws-login').disabled=true;$('credential-dialog-result').textContent='Opening AWS sign-in...';
+  try{const result=await api().login_aws();$('credential-dialog-result').className='dialog-result valid';$('credential-dialog-result').textContent=result.message;}
+  catch(error){$('credential-dialog-result').className='dialog-result invalid';$('credential-dialog-result').textContent=error.message||'AWS sign-in failed.';}
+  finally{$('aws-login').disabled=false;}
+}
 function clearCredentialFeedback(){
   $('credential-feedback').className='credential-feedback hidden';$('credential-message').textContent='';$('credential-help').classList.add('hidden');$('credential-help').open=false;$('credential-help-content').replaceChildren();
 }
@@ -242,11 +288,12 @@ async function initialize(){
   if(initializationStarted)return;
   initializationStarted=true;
   try{
-    providers=await bridge.list_providers(); $('provider').replaceChildren(); providers.forEach((p)=>option($('provider'),p.id,p.display_name)); refreshLocations(); renderSteps('idle'); startTimer(); await loadLegacyStates(); await loadRecovery(); setInterval(()=>{if(!document.hidden)reconcileCurrentDeployment().catch(()=>{});},1000); setInterval(()=>{if(!document.hidden)loadRecovery().catch(()=>{});},5000);
+    providers=await bridge.list_providers(); $('provider').replaceChildren(); providers.forEach((p)=>option($('provider'),p.id,p.display_name)); refreshLocations(); renderSteps('idle'); startTimer(); await refreshCredentialStatus(); await loadLegacyStates(); await loadRecovery(); setInterval(()=>{if(!document.hidden)reconcileCurrentDeployment().catch(()=>{});},1000); setInterval(()=>{if(!document.hidden)loadRecovery().catch(()=>{});},5000);
   }catch(error){initializationStarted=false;$('status-text').textContent='Application initialization failed';throw error;}
 }
-  $('provider').addEventListener('change',()=>{clearCredentialFeedback();refreshLocations();renderLegacyStates();setBusy(false);}); $('country').addEventListener('change',refreshRegions); $('location').addEventListener('change',refreshBadges);
+  $('provider').addEventListener('change',()=>{clearCredentialFeedback();refreshLocations();renderLegacyStates();setBusy(false);refreshCredentialStatus().catch(()=>{});}); $('country').addEventListener('change',refreshRegions); $('location').addEventListener('change',refreshBadges);
 $('deploy').addEventListener('click',()=>deploy().catch((e)=>{alert(e.message);setBusy(Boolean(operationId||activeDeploymentId));})); $('validate-credentials').addEventListener('click',()=>validateCredentials().catch((e)=>alert(e.message))); $('destroy').addEventListener('click',destroy); $('remove-local').addEventListener('click',removeLocal); $('cancel').addEventListener('click',async()=>{if(deploymentId)await api().cancel(deploymentId);});
 $('copy-ip').addEventListener('click',()=>navigator.clipboard.writeText($('ip-address').textContent)); $('save-config').addEventListener('click',()=>saveConfig());
 $('open-recovery').addEventListener('click',()=>{$('legacy-tools').open=true;$('recovery').scrollIntoView({behavior:'smooth',block:'start'});});
+$('manage-credentials').addEventListener('click',()=>openCredentialDialog().catch((e)=>alert(e.message)));$('credential-close').addEventListener('click',closeCredentialDialog);$('credential-cancel').addEventListener('click',closeCredentialDialog);$('credential-save').addEventListener('click',saveCredentials);$('credential-remove').addEventListener('click',()=>removeCredentials());$('aws-login').addEventListener('click',loginAws);$('credential-dialog').addEventListener('close',clearCredentialInputs);
 window.addEventListener('beforeunload',(event)=>{if(currentRecord?.resources_possible&&currentRecord.state!=='destroyed'){event.preventDefault();event.returnValue='Active cloud resources may still exist.';}}); window.addEventListener('pywebviewready',initialize); document.addEventListener('DOMContentLoaded',initialize);

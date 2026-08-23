@@ -15,6 +15,7 @@ from config_export import (
     proposed_export_path,
     resolve_desktop_directory,
 )
+from credential_store import CredentialStore, platform_credential_store
 from file_lock import FileLock
 from models import DeploymentOptions, DeploymentState
 from orchestrator import Orchestrator
@@ -61,13 +62,18 @@ class BridgeService:
         start_expiration_monitor: bool = True,
         acquire_app_lock: bool = True,
         save_dialog: SaveDialog = native_save_dialog,
+        credential_store: CredentialStore | None = None,
     ) -> None:
         resolved_runtime = (runtime_root or default_runtime_root()).resolve()
         self._app_lock: FileLock | None = None
         if acquire_app_lock:
             self._app_lock = FileLock(resolved_runtime / "application.lock", timeout=0.2)
             self._app_lock.__enter__()
-        self.orchestrator = Orchestrator(resource_root, resolved_runtime)
+        self.orchestrator = Orchestrator(
+            resource_root,
+            resolved_runtime,
+            credential_store=credential_store or platform_credential_store(),
+        )
         self._operations: dict[str, threading.Thread] = {}
         self._operation_deployments: dict[str, str] = {}
         self._operation_results: dict[str, dict[str, object]] = {}
@@ -91,6 +97,18 @@ class BridgeService:
 
     def validate_credentials(self, provider_id: str) -> dict[str, object]:
         return self.orchestrator.validate_credentials(provider_id)
+
+    def credential_status(self, provider_id: str) -> dict[str, object]:
+        return self.orchestrator.credential_status(provider_id)
+
+    def save_provider_credentials(self, provider_id: str, values: dict[str, object]) -> dict[str, object]:
+        return self.orchestrator.save_provider_credentials(provider_id, values)
+
+    def remove_provider_credentials(self, provider_id: str, confirmed_active: bool = False) -> dict[str, object]:
+        return self.orchestrator.remove_provider_credentials(provider_id, confirmed_active)
+
+    def login_aws(self) -> dict[str, object]:
+        return self.orchestrator.login_aws()
 
     def deploy(
         self,
